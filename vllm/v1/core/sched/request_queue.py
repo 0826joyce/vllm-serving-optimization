@@ -197,6 +197,15 @@ class PriorityRequestQueue(RequestQueue):
         while heap_copy:
             yield heapq.heappop(heap_copy)
 
+    def _reheapify(self) -> None:
+        """Re-heapify the internal heap after external priority changes.
+
+        This should be called after effective priorities of requests in
+        the queue have been updated (e.g., by the QoS priority system),
+        since the heap ordering may no longer be valid.
+        """
+        heapq.heapify(self._heap)
+
 
 def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
     """Create request queue based on scheduling policy."""
