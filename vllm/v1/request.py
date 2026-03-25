@@ -56,6 +56,29 @@ class StreamingUpdate:
 
 
 class Request:
+
+    # ---- QoS Priority Configuration ----
+    # Prompt length thresholds for automatic priority boosting.
+    # Requests shorter than SHORT_PROMPT_THRESHOLD get a priority boost
+    # (lower effective_priority value = higher scheduling priority).
+    SHORT_PROMPT_THRESHOLD: int = 512      # tokens
+    MEDIUM_PROMPT_THRESHOLD: int = 2048    # tokens
+
+    # Priority boost values applied based on prompt length.
+    # These are *subtracted* from the base priority, so a positive boost
+    # means higher scheduling priority (smaller effective_priority).
+    SHORT_PROMPT_BOOST: int = 2    # short requests get significant boost
+    MEDIUM_PROMPT_BOOST: int = 1   # medium requests get moderate boost
+    LONG_PROMPT_PENALTY: int = 1   # long requests get slight penalty
+
+    # Anti-starvation: how fast waiting time decays priority.
+    # Every STARVATION_DECAY_INTERVAL seconds of waiting reduces
+    # effective_priority by 1 (making the request more urgent).
+    STARVATION_DECAY_INTERVAL: float = 5.0  # seconds
+
+    # Maximum priority boost from waiting time decay (caps the effect).
+    MAX_STARVATION_BOOST: int = 10
+
     def __init__(
         self,
         request_id: str,
@@ -77,6 +100,8 @@ class Request:
         self.request_id = request_id
         self.client_index = client_index
         self.priority = priority
+        # QoS: cached effective priority (updated by scheduler each step)
+        self._effective_priority: int | None = None
         self.sampling_params = sampling_params
         self.pooling_params = pooling_params
         self.lora_request = lora_request
@@ -278,13 +303,78 @@ class Request:
         events, self.events = self.events, []
         return events
 
+    @property
+    def effective_priority(self) -> int:
+        """Get the effective priority for scheduling decisions.
+
+        This is the multi-dimensional priority that combines:
+        1. API-provided base priority
+        2. Prompt length-based boost (short requests get higher priority)
+        3. Waiting time anti-starvation decay
+
+        Lower value = higher scheduling priority.
+        If not yet computed, falls back to static priority.
+        """
+        if self._effective_priority is not None:
+            return self._effective_priority
+        return self.priority
+
+    def compute_effective_priority(self, now: float | None = None) -> int:
+        """Compute and cache the multi-dimensional effective priority.
+
+        This method should be called by the scheduler at the beginning of
+        each scheduling step for all waiting requests.
+
+        Args:
+            now: Current time (monotonic). If None, uses time.time().
+
+        Returns:
+            The computed effective priority value.
+            Lower value = higher scheduling priority.
+        """
+        if now is None:
+            now = time.time()
+
+        # Start with API-provided base priority.
+        # Lower priority value = higher scheduling priority.
+        base = self.priority
+
+        # 1. Prompt length-based boost:
+        #    Short prompts (<512 tokens) get priority boost (subtracted).
+        #    Long prompts (>2048 tokens) get slight penalty (added).
+        num_prompt = self.num_prompt_tokens
+        if num_prompt < self.SHORT_PROMPT_THRESHOLD:
+            length_adjustment = -self.SHORT_PROMPT_BOOST
+        elif num_prompt < self.MEDIUM_PROMPT_THRESHOLD:
+            length_adjustment = -self.MEDIUM_PROMPT_BOOST
+        else:
+            length_adjustment = self.LONG_PROMPT_PENALTY
+
+        # 2. Anti-starvation waiting time decay:
+        #    Every STARVATION_DECAY_INTERVAL seconds of waiting reduces
+        #    effective priority by 1 (capped at MAX_STARVATION_BOOST).
+        waiting_time = now - self.arrival_time
+        starvation_boost = min(
+            int(waiting_time / self.STARVATION_DECAY_INTERVAL),
+            self.MAX_STARVATION_BOOST,
+        )
+
+        # Combine: lower value = higher priority
+        self._effective_priority = base + length_adjustment - starvation_boost
+        return self._effective_priority
+
     def __lt__(self, other: "Request") -> bool:
         """
-        Compare two requests based on priority, arrival time, and request ID.
-        Used in priority scheduling.
+        Compare two requests based on effective priority, arrival time,
+        and request ID. Used in priority scheduling.
+
+        Uses effective_priority (multi-dimensional) if computed,
+        otherwise falls back to static priority.
         """
-        if self.priority != other.priority:
-            return self.priority < other.priority
+        self_prio = self.effective_priority
+        other_prio = other.effective_priority
+        if self_prio != other_prio:
+            return self_prio < other_prio
         if self.arrival_time != other.arrival_time:
             return self.arrival_time < other.arrival_time
         if self.request_id != other.request_id:

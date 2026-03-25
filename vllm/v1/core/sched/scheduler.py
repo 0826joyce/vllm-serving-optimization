@@ -46,6 +46,7 @@ from vllm.v1.core.sched.output import (
     SchedulerOutput,
 )
 from vllm.v1.core.sched.request_queue import (
+    PriorityRequestQueue,
     RequestQueue,
     SchedulingPolicy,
     create_request_queue,
@@ -370,6 +371,12 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
+        # QoS: Update effective priorities for all waiting requests.
+        # This implements multi-dimensional priority computation:
+        # base_priority + prompt_length_boost + anti_starvation_decay
+        if self.policy == SchedulingPolicy.PRIORITY:
+            self._update_effective_priorities()
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -463,9 +470,13 @@ class Scheduler(SchedulerInterface):
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
                     if self.policy == SchedulingPolicy.PRIORITY:
+                        # QoS: Use effective_priority (multi-dimensional)
+                        # for preemption decisions. Higher value = lower
+                        # priority = preempt first.
                         preempted_req = max(
                             self.running,
-                            key=lambda r: (r.priority, r.arrival_time),
+                            key=lambda r: (
+                                r.effective_priority, r.arrival_time),
                         )
                         self.running.remove(preempted_req)
                         if preempted_req in scheduled_running_reqs:
@@ -950,6 +961,43 @@ class Scheduler(SchedulerInterface):
 
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
+
+    def _update_effective_priorities(self) -> None:
+        """QoS: Update effective priorities for all waiting requests.
+
+        This method implements multi-dimensional priority computation by
+        calling compute_effective_priority() on each waiting request.
+        The effective priority combines:
+        1. API-provided base priority
+        2. Prompt length-based boost (short requests get higher priority)
+        3. Waiting time anti-starvation decay (prevents starvation)
+
+        For PriorityRequestQueue, after updating priorities we need to
+        re-heapify the queue since the ordering may have changed.
+
+        For running requests, we also update their effective priorities
+        so that preemption decisions use the latest values.
+        """
+        now = time.time()
+
+        # Update waiting queue priorities.
+        for request in self.waiting:
+            request.compute_effective_priority(now)
+
+        # Re-heapify the waiting queue if it's a priority queue.
+        if isinstance(self.waiting, PriorityRequestQueue):
+            self.waiting._reheapify()
+
+        # Update skipped_waiting queue priorities.
+        for request in self.skipped_waiting:
+            request.compute_effective_priority(now)
+
+        if isinstance(self.skipped_waiting, PriorityRequestQueue):
+            self.skipped_waiting._reheapify()
+
+        # Update running request priorities for preemption decisions.
+        for request in self.running:
+            request.compute_effective_priority(now)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
