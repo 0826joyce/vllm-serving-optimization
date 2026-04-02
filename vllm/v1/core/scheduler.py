@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import heapq
 import time
 from collections import deque
 from typing import Deque, Dict, Iterable, List, Optional, Set, Tuple, Union
@@ -61,6 +62,15 @@ class Scheduler:
         # Priority queues for requests.
         self.waiting: Deque[Request] = deque()
         self.running: List[Request] = []
+
+        # ---- QoS Priority Scheduling ----
+        # When enabled, the scheduler uses effective_priority to:
+        # 1. Sort waiting queue (priority heap) each scheduling step
+        # 2. Choose preemption victims (lowest priority = highest value)
+        # Enable via scheduling_policy="priority" in SchedulerConfig,
+        # or default to True when available.
+        self.enable_qos_priority: bool = getattr(
+            scheduler_config, 'scheduling_policy', 'fcfs') == 'priority'
         # The requests that have been scheduled and are being executed
         # by the executor.
         self.scheduled_req_ids: Set[str] = set()
@@ -125,6 +135,13 @@ class Scheduler:
         # For logging.
         scheduled_timestamp = time.monotonic()
 
+        # ---- QoS: Update effective priorities ----
+        # Before scheduling, recompute multi-dimensional priorities for
+        # all requests so that waiting queue ordering and preemption
+        # decisions reflect the latest state (waiting time, etc.).
+        if self.enable_qos_priority:
+            self._update_effective_priorities()
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -160,7 +177,18 @@ class Scheduler:
                 if new_blocks is None:
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
-                    preempted_req = self.running.pop()
+                    if self.enable_qos_priority and len(self.running) > 1:
+                        # QoS: Preempt the request with highest
+                        # effective_priority value (= lowest priority).
+                        preempted_req = max(
+                            self.running,
+                            key=lambda r: (
+                                r.effective_priority, r.arrival_time),
+                        )
+                        self.running.remove(preempted_req)
+                    else:
+                        # FCFS fallback: preempt last added (LIFO).
+                        preempted_req = self.running.pop()
                     self.kv_cache_manager.free(preempted_req)
                     preempted_req.status = RequestStatus.PREEMPTED
                     preempted_req.num_computed_tokens = 0
@@ -648,6 +676,33 @@ class Scheduler:
         self._cached_reqs_data.pop(request.request_id, None)
         del self.requests[request.request_id]
         self.finished_req_ids.add(request.request_id)
+
+    def _update_effective_priorities(self) -> None:
+        """QoS: Update effective priorities for all requests.
+
+        This method implements multi-dimensional priority computation by
+        calling compute_effective_priority() on each request.
+        The effective priority combines:
+        1. API-provided base priority
+        2. Prompt length-based boost (short requests get higher priority)
+        3. Waiting time anti-starvation decay (prevents starvation)
+
+        After updating priorities, the waiting queue is re-sorted so that
+        the highest-priority request is at the front (index 0).
+        Running request priorities are also updated for preemption decisions.
+        """
+        now = time.time()
+
+        # Update waiting queue priorities and re-sort.
+        for request in self.waiting:
+            request.compute_effective_priority(now)
+        # Re-sort waiting queue by effective priority (lowest value first).
+        sorted_waiting = sorted(self.waiting)
+        self.waiting = deque(sorted_waiting)
+
+        # Update running request priorities for preemption decisions.
+        for request in self.running:
+            request.compute_effective_priority(now)
 
     def get_num_unfinished_requests(self) -> int:
         return len(self.waiting) + len(self.running)
