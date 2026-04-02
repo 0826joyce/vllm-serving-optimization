@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import enum
+import time
 from typing import TYPE_CHECKING, List, Optional, Union
 
 from vllm.lora.request import LoRARequest
@@ -16,6 +17,26 @@ if TYPE_CHECKING:
 
 class Request:
 
+    # ---- QoS Priority Configuration ----
+    # Prompt length thresholds for automatic priority boosting.
+    # Requests shorter than SHORT_PROMPT_THRESHOLD get a priority boost
+    # (lower effective_priority value = higher scheduling priority).
+    SHORT_PROMPT_THRESHOLD: int = 512      # tokens
+    MEDIUM_PROMPT_THRESHOLD: int = 2048    # tokens
+
+    # Priority boost values applied based on prompt length.
+    # These are *subtracted* from the base priority, so a positive boost
+    # means higher scheduling priority (smaller effective_priority).
+    SHORT_PROMPT_BOOST: int = 2    # short requests get significant boost
+    MEDIUM_PROMPT_BOOST: int = 1   # medium requests get moderate boost
+    LONG_PROMPT_PENALTY: int = 1   # long requests get slight penalty
+
+    # Anti-starvation: how fast waiting time decays priority.
+    # Every STARVATION_DECAY_INTERVAL seconds of waiting reduces
+    # effective_priority by 1 (i.e., raises scheduling priority).
+    STARVATION_DECAY_INTERVAL: float = 5.0   # seconds
+    MAX_STARVATION_BOOST: int = 10           # cap on starvation boost
+
     def __init__(
         self,
         request_id: str,
@@ -28,11 +49,13 @@ class Request:
         eos_token_id: Optional[int],
         arrival_time: float,
         lora_request: Optional[LoRARequest] = None,
+        priority: int = 0,
     ) -> None:
         self.request_id = request_id
         self.sampling_params = sampling_params
         # Because of LoRA, the eos token id can be different for each request.
         self.eos_token_id = eos_token_id
+        self.arrival_time = arrival_time
         self.lora_request = lora_request
 
         self.status = RequestStatus.WAITING
@@ -64,6 +87,78 @@ class Request:
         # they should also be updated simultaneously.
         self.output_token_ids = ConstantList(self._output_token_ids)
         self.all_token_ids = ConstantList(self._all_token_ids)
+
+        # ---- QoS Priority Fields ----
+        # Base priority from API caller (lower value = higher priority).
+        self.priority = priority
+        # Effective priority computed by multi-dimensional formula.
+        # Updated dynamically each scheduling step.
+        self._effective_priority: float = float(priority)
+
+    # ---- QoS Priority Methods ----
+
+    @property
+    def effective_priority(self) -> float:
+        """Return the last computed effective priority.
+
+        Lower value = higher scheduling priority.
+        """
+        return self._effective_priority
+
+    def compute_effective_priority(self,
+                                   now: Optional[float] = None) -> float:
+        """Compute multi-dimensional effective priority.
+
+        Formula:
+            effective_priority = base_priority
+                                 + length_adjustment
+                                 - starvation_boost
+
+        Where:
+        - base_priority: API-provided static priority (default 0)
+        - length_adjustment: automatic boost based on prompt token count
+          (short prompts get negative adjustment = higher priority)
+        - starvation_boost: increases over time to prevent starvation
+          (subtracted, so longer wait = higher priority)
+        """
+        if now is None:
+            now = time.time()
+
+        base = self.priority
+
+        # Length-based adjustment
+        if self.num_prompt_tokens < self.SHORT_PROMPT_THRESHOLD:
+            length_adjustment = -self.SHORT_PROMPT_BOOST
+        elif self.num_prompt_tokens < self.MEDIUM_PROMPT_THRESHOLD:
+            length_adjustment = -self.MEDIUM_PROMPT_BOOST
+        else:
+            length_adjustment = self.LONG_PROMPT_PENALTY
+
+        # Anti-starvation boost based on waiting time
+        waiting_time = max(0.0, now - self.arrival_time)
+        starvation_boost = min(
+            int(waiting_time / self.STARVATION_DECAY_INTERVAL),
+            self.MAX_STARVATION_BOOST,
+        )
+
+        # Combine: lower value = higher priority
+        self._effective_priority = base + length_adjustment - starvation_boost
+        return self._effective_priority
+
+    def __lt__(self, other: "Request") -> bool:
+        """Compare two requests for priority scheduling.
+
+        Uses effective_priority (multi-dimensional) if computed,
+        otherwise falls back to arrival_time (FCFS).
+        Lower effective_priority = higher scheduling priority.
+        """
+        self_prio = self.effective_priority
+        other_prio = other.effective_priority
+        if self_prio != other_prio:
+            return self_prio < other_prio
+        if self.arrival_time != other.arrival_time:
+            return self.arrival_time < other.arrival_time
+        return self.request_id < other.request_id
 
     @classmethod
     def from_engine_core_request(cls, request: EngineCoreRequest) -> "Request":
