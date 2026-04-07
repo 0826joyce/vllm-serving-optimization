@@ -147,7 +147,7 @@
 
 ---
 
-### 优化 4：Token 级速率控制 `[P1]` `[未实现]`
+### 优化 4：Token 级速率控制 `[P1]` `[已实现]`
 
 > 对应能力迁移：**云存储 IO 限速 → 令牌桶（Token Bucket）/ 漏桶（Leaky Bucket）**
 
@@ -175,12 +175,17 @@
          tokens: float  # 当前桶内余量
      ```
   2. **差异化限速**：高优请求不限速（rate=∞），低优请求根据当前系统负载动态调整 rate：
-     - 系统空闲时：低优也不限速（充分利用资源）
-     - 系统繁忙时：低优限速，为高优让出 token_budget
-  3. **集成到调度器**：在 `schedule()` 中计算 `num_new_tokens` 时，叠加速率限制：
+     - 系统空闲时（running/max < 50%）：低优也不限速（充分利用资源）
+     - 系统中等负载时（50%-80%）：低优限速（rate=16 tokens/step），普通限速（rate=64 tokens/step）
+     - 系统高负载时（>80%）：低优激进限速（rate=8），普通也限速（rate=32）
+  3. **优先级分层**：基于 MLFQ 级别判定（L0-L1=HIGH, L2=NORMAL, L3+=LOW），或基于 effective_priority 回退
+  4. **集成到调度器**：在 `schedule()` 中计算 `num_new_tokens` 时，叠加速率限制：
      ```python
-     num_new_tokens = min(num_new_tokens, token_budget, rate_limiter.available())
+     if request.rate_limiter.is_limited():
+         allowed = request.rate_limiter.consume(num_new_tokens)
+         num_new_tokens = allowed  # 可能被削减
      ```
+  5. **每步桶补充**：调度步开始时 `_update_rate_limiters()` 自动 refill 令牌桶并根据系统负载动态调整 rate
 
 #### 预期效果
 
@@ -631,7 +636,7 @@
 | 1. QoS 分级调度 | P0 | ✅ 已实现 | `vllm/v1/core/scheduler.py`, `vllm/v1/request.py` | 网关优先级队列 |
 | 2. KV 水位线流控 | P0 | 🔲 未实现 | `vllm/v1/core/kv_cache_manager.py`, `vllm/v1/core/scheduler.py` | 存储水位线 + IO 配额 |
 | 3. 准入控制 | P1 | 🔲 未实现 | `vllm/v1/engine/processor.py`, `vllm/v1/core/kv_cache_manager.py` | ECN + RED 拥塞控制 |
-| 4. Token 限速 | P1 | 🔲 未实现 | `vllm/v1/core/scheduler.py`, `vllm/v1/request.py` | 令牌桶 / 漏桶限速 |
+| 4. Token 限速 | P1 | ✅ 已实现 | `vllm/v1/core/scheduler.py`, `vllm/v1/request.py` | 令牌桶 / 漏桶限速 |
 | 5. Deadline/EDF 调度 | P2 | 🔲 未实现 | `vllm/v1/request.py`, `vllm/v1/core/scheduler.py`, `vllm/v1/engine/processor.py` | EDF + fq_codel / HFSC |
 | 6. WFQ 公平调度 | P2 | 🔲 未实现 | `vllm/v1/core/scheduler.py`, `vllm/v1/request.py`, 新增 `vllm/v1/core/tenant_manager.py` | WFQ / DRR + per-tenant 配额 |
 | 7. MLFQ 多级反馈 | P3 | ✅ 已实现 | `vllm/v1/core/scheduler.py`, `vllm/v1/request.py` | OS MLFQ / CFS |
@@ -696,7 +701,7 @@ python benchmarks/qos_benchmark.py --baseline --optimized --output results/
 - [ ] 优化 2：KV 缓存水位线流控（P0）
 - [ ] 优化 8：KV Cache 分层存储与智能迁移（P1）
 - [ ] 优化 3：请求准入控制（P1）
-- [ ] 优化 4：Token 级速率控制（P1）
+- [x] 优化 4：Token 级速率控制（P1）
 - [ ] 优化 5：Deadline/EDF 调度（P2）
 - [ ] 优化 6：WFQ 加权公平调度（P2）
 - [x] 优化 7：MLFQ 多级反馈队列（P3）

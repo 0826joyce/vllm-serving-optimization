@@ -16,6 +16,83 @@ if TYPE_CHECKING:
     from vllm.multimodal.inputs import PlaceholderRange
 
 
+# ---- Token Rate Limiter (Token Bucket) ----
+# Per-request token generation rate control.  High-priority requests are
+# not rate-limited; low-priority requests are throttled so that compute
+# resources (token_budget) are freed for high-priority requests.
+# This is analogous to IO QoS token-bucket / leaky-bucket rate limiting
+# in cloud storage systems.
+
+class TokenRateLimiter:
+    """Per-request token bucket rate limiter.
+
+    Each request carries its own token bucket.  The bucket is refilled at
+    ``rate`` tokens per scheduling step.  ``burst`` controls the maximum
+    number of tokens that can accumulate (for bursty generation).
+
+    A rate of ``math.inf`` means *no limit* (high-priority / idle system).
+    """
+
+    # Default rates per priority tier.  These are overridden by the
+    # scheduler based on system load.
+    #   HIGH  -> unlimited (no throttle)
+    #   NORMAL -> moderate limit under load
+    #   LOW   -> aggressive limit under load
+    DEFAULT_RATE_HIGH: float = math.inf
+    DEFAULT_RATE_NORMAL: float = 64.0   # tokens per step
+    DEFAULT_RATE_LOW: float = 16.0      # tokens per step
+    DEFAULT_BURST: int = 128            # max burst capacity
+
+    # Load thresholds: when the fraction of running requests relative to
+    # max_num_running_reqs exceeds these thresholds, rate limiting kicks in.
+    LOAD_THRESHOLD_MODERATE: float = 0.5   # 50% → start limiting low-prio
+    LOAD_THRESHOLD_HIGH: float = 0.8       # 80% → aggressive limiting
+
+    def __init__(
+        self,
+        rate: float = math.inf,
+        burst: int = 128,
+    ) -> None:
+        self.rate = rate      # tokens replenished per step
+        self.burst = burst    # maximum bucket capacity
+        self.tokens = float(burst)  # current available tokens
+
+    def refill(self) -> None:
+        """Refill the bucket (called once per scheduling step)."""
+        if self.rate == math.inf:
+            self.tokens = float(self.burst)
+        else:
+            self.tokens = min(self.tokens + self.rate, float(self.burst))
+
+    def consume(self, requested: int) -> int:
+        """Try to consume ``requested`` tokens.
+
+        Returns the number of tokens actually allowed (may be less than
+        ``requested`` if the bucket is drained).
+        """
+        if self.rate == math.inf:
+            return requested
+        allowed = min(requested, max(0, int(self.tokens)))
+        self.tokens -= allowed
+        return allowed
+
+    def available(self) -> int:
+        """Return the number of tokens currently available."""
+        if self.rate == math.inf:
+            return 2**31  # effectively unlimited
+        return max(0, int(self.tokens))
+
+    def set_rate(self, rate: float, burst: Optional[int] = None) -> None:
+        """Dynamically adjust the rate and optionally the burst size."""
+        self.rate = rate
+        if burst is not None:
+            self.burst = burst
+
+    def is_limited(self) -> bool:
+        """Return True if this limiter imposes any restriction."""
+        return self.rate != math.inf
+
+
 # ---- MLFQ Level Configuration ----
 # Multi-Level Feedback Queue: requests start at the highest priority level
 # (L0) and are demoted to lower levels as they consume more token budget.
@@ -128,6 +205,12 @@ class Request:
         # Effective priority computed by multi-dimensional formula.
         # Updated dynamically each scheduling step.
         self._effective_priority: float = float(priority)
+
+        # ---- Token Rate Limiter Fields ----
+        # Per-request token bucket for rate-limiting token generation.
+        # High-priority requests get unlimited rate; low-priority requests
+        # are throttled under load to free token_budget for high-priority ones.
+        self.rate_limiter: TokenRateLimiter = TokenRateLimiter()
 
         # ---- MLFQ (Multi-Level Feedback Queue) Fields ----
         # Current MLFQ level (0 = highest priority, MLFQ_NUM_LEVELS-1 = lowest).
