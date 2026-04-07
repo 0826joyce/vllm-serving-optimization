@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import enum
+import math
 import time
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from vllm.lora.request import LoRARequest
 from vllm.sampling_params import SamplingParams
@@ -13,6 +14,39 @@ from vllm.v1.utils import ConstantList
 if TYPE_CHECKING:
     from vllm.multimodal import MultiModalKwargs
     from vllm.multimodal.inputs import PlaceholderRange
+
+
+# ---- MLFQ Level Configuration ----
+# Multi-Level Feedback Queue: requests start at the highest priority level
+# (L0) and are demoted to lower levels as they consume more token budget.
+# Short requests naturally finish at high levels; long requests gradually
+# sink to lower levels — no explicit priority annotation needed.
+
+class MLFQLevel:
+    """Configuration for a single MLFQ level."""
+
+    def __init__(self, level: int, name: str, token_quota: float):
+        self.level = level
+        self.name = name
+        # Max cumulative tokens a request can consume at this level
+        # before being demoted to the next level.
+        self.token_quota = token_quota
+
+    def __repr__(self) -> str:
+        return f"MLFQLevel(L{self.level}, {self.name}, quota={self.token_quota})"
+
+
+# Default MLFQ level definitions.
+# token_quota is the cumulative token budget threshold for demotion.
+MLFQ_LEVELS: List[MLFQLevel] = [
+    MLFQLevel(level=0, name="interactive", token_quota=128),
+    MLFQLevel(level=1, name="standard", token_quota=512),
+    MLFQLevel(level=2, name="batch", token_quota=2048),
+    MLFQLevel(level=3, name="background", token_quota=math.inf),
+]
+
+# Number of MLFQ levels.
+MLFQ_NUM_LEVELS: int = len(MLFQ_LEVELS)
 
 
 class Request:
@@ -95,6 +129,14 @@ class Request:
         # Updated dynamically each scheduling step.
         self._effective_priority: float = float(priority)
 
+        # ---- MLFQ (Multi-Level Feedback Queue) Fields ----
+        # Current MLFQ level (0 = highest priority, MLFQ_NUM_LEVELS-1 = lowest).
+        self.mlfq_level: int = 0
+        # Cumulative output tokens generated so far for MLFQ accounting.
+        # This tracks the "CPU time" consumed by the request, used to
+        # decide when to demote to a lower level.
+        self.mlfq_tokens_consumed: int = 0
+
     # ---- QoS Priority Methods ----
 
     @property
@@ -144,6 +186,34 @@ class Request:
         # Combine: lower value = higher priority
         self._effective_priority = base + length_adjustment - starvation_boost
         return self._effective_priority
+
+    # ---- MLFQ Methods ----
+
+    def mlfq_account_tokens(self, num_tokens: int) -> None:
+        """Account for tokens consumed by this request in the MLFQ.
+
+        Called after each scheduling step with the number of *output* tokens
+        generated.  When the cumulative consumption exceeds the current
+        level's quota the request is automatically demoted.
+        """
+        self.mlfq_tokens_consumed += num_tokens
+        # Check if demotion is needed.
+        current_level = MLFQ_LEVELS[self.mlfq_level]
+        if (self.mlfq_tokens_consumed >= current_level.token_quota
+                and self.mlfq_level < MLFQ_NUM_LEVELS - 1):
+            self.mlfq_level += 1
+
+    def mlfq_promote(self) -> None:
+        """Promote the request by one MLFQ level (anti-starvation).
+
+        Called when a request is preempted — it gets promoted one level
+        (but not beyond L0) so that it receives slightly better treatment
+        when re-scheduled.  The token consumption counter is **not** reset
+        so that the request cannot game the system by being repeatedly
+        preempted.
+        """
+        if self.mlfq_level > 0:
+            self.mlfq_level -= 1
 
     def __lt__(self, other: "Request") -> bool:
         """Compare two requests for priority scheduling.

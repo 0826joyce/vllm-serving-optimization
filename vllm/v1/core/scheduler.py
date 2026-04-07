@@ -17,7 +17,8 @@ from vllm.v1.engine import (EngineCoreEvent, EngineCoreEventType,
                             EngineCoreOutput, EngineCoreOutputs)
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.request import Request, RequestStatus
+from vllm.v1.request import (MLFQ_LEVELS, MLFQ_NUM_LEVELS, Request,
+                             RequestStatus)
 
 logger = init_logger(__name__)
 
@@ -71,6 +72,18 @@ class Scheduler:
         # or default to True when available.
         self.enable_qos_priority: bool = getattr(
             scheduler_config, 'scheduling_policy', 'fcfs') == 'priority'
+
+        # ---- MLFQ (Multi-Level Feedback Queue) Scheduling ----
+        # When enabled, the waiting queue is replaced by N level-queues.
+        # Requests start at L0 (highest priority) and are demoted as they
+        # consume more tokens.  Scheduling always picks from the highest
+        # non-empty level first; within a level, FCFS ordering is used.
+        self.enable_mlfq: bool = True
+        # Multi-level waiting queues: mlfq_queues[i] holds waiting requests
+        # at MLFQ level i.  Level 0 = highest priority (interactive).
+        self.mlfq_queues: List[Deque[Request]] = [
+            deque() for _ in range(MLFQ_NUM_LEVELS)
+        ]
         # The requests that have been scheduled and are being executed
         # by the executor.
         self.scheduled_req_ids: Set[str] = set()
@@ -193,6 +206,13 @@ class Scheduler:
                     preempted_req.status = RequestStatus.PREEMPTED
                     preempted_req.num_computed_tokens = 0
 
+                    if self.enable_mlfq:
+                        # MLFQ: promote preempted request by one level
+                        # (anti-starvation) and insert into the correct
+                        # level queue.
+                        preempted_req.mlfq_promote()
+                        self.mlfq_queues[preempted_req.mlfq_level].appendleft(
+                            preempted_req)
                     self.waiting.appendleft(preempted_req)
                     preempted_reqs.append(preempted_req)
                     if preempted_req == request:
@@ -251,7 +271,12 @@ class Scheduler:
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
-                request = self.waiting[0]
+                if self.enable_mlfq:
+                    request = self._mlfq_peek_next()
+                    if request is None:
+                        break
+                else:
+                    request = self.waiting[0]
 
                 # Check that adding the request still respects the max_loras
                 # constraint.
@@ -306,7 +331,11 @@ class Scheduler:
                     # The request cannot be scheduled.
                     break
 
-                self.waiting.popleft()
+                if self.enable_mlfq:
+                    self._mlfq_pop_next()
+                    self.waiting.remove(request)
+                else:
+                    self.waiting.popleft()
                 self.running.append(request)
                 self.scheduled_req_ids.add(request.request_id)
                 if request.status == RequestStatus.WAITING:
@@ -584,6 +613,10 @@ class Scheduler:
                         self._free_request(request)
                         break
 
+                # ---- MLFQ: Account consumed tokens for demotion ----
+                if self.enable_mlfq and new_token_ids:
+                    request.mlfq_account_tokens(len(new_token_ids))
+
                 # Extract sample logprobs if needed.
                 if request.sampling_params.logprobs is not None:
                     assert logprobs is not None
@@ -634,8 +667,16 @@ class Scheduler:
         return False
 
     def add_request(self, request: Request) -> None:
-        self.waiting.append(request)
         self.requests[request.request_id] = request
+        if self.enable_mlfq:
+            # New requests always enter at MLFQ level 0 (highest priority).
+            request.mlfq_level = 0
+            request.mlfq_tokens_consumed = 0
+            self.mlfq_queues[0].append(request)
+            # Also keep in self.waiting for compatibility (stats, etc.).
+            self.waiting.append(request)
+        else:
+            self.waiting.append(request)
         self.request_queued(request)
 
     def finish_requests(
@@ -665,6 +706,8 @@ class Scheduler:
                     self.scheduled_req_ids.remove(request.request_id)
             else:
                 self.waiting.remove(request)
+                if self.enable_mlfq:
+                    self._mlfq_remove_from_level(request)
             request.status = finished_status
             self._free_request(request)
 
@@ -703,6 +746,50 @@ class Scheduler:
         # Update running request priorities for preemption decisions.
         for request in self.running:
             request.compute_effective_priority(now)
+
+    # ---- MLFQ Helper Methods ----
+
+    def _mlfq_peek_next(self) -> Optional[Request]:
+        """Return the next request to schedule from the MLFQ queues.
+
+        Scans levels from L0 (highest priority) to L_{N-1} (lowest).
+        Returns the front request of the first non-empty level, or None
+        if all levels are empty.
+        """
+        for level_queue in self.mlfq_queues:
+            if level_queue:
+                return level_queue[0]
+        return None
+
+    def _mlfq_pop_next(self) -> Optional[Request]:
+        """Pop and return the next request from the MLFQ queues.
+
+        Same scanning order as _mlfq_peek_next but actually removes
+        the request from its level queue.
+        """
+        for level_queue in self.mlfq_queues:
+            if level_queue:
+                return level_queue.popleft()
+        return None
+
+    def _mlfq_remove_from_level(self, request: Request) -> None:
+        """Remove a request from its MLFQ level queue.
+
+        Used when a request is finished or aborted while still in the
+        waiting state.
+        """
+        level = request.mlfq_level
+        try:
+            self.mlfq_queues[level].remove(request)
+        except ValueError:
+            # The request may not be in the expected level queue if it was
+            # already removed (e.g., race between finish and schedule).
+            for q in self.mlfq_queues:
+                try:
+                    q.remove(request)
+                    break
+                except ValueError:
+                    continue
 
     def get_num_unfinished_requests(self) -> int:
         return len(self.waiting) + len(self.running)
