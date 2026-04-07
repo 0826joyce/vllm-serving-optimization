@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import heapq
+import math
 import time
 from collections import deque
 from typing import Deque, Dict, Iterable, List, Optional, Set, Tuple, Union
@@ -18,7 +19,7 @@ from vllm.v1.engine import (EngineCoreEvent, EngineCoreEventType,
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import (MLFQ_LEVELS, MLFQ_NUM_LEVELS, Request,
-                             RequestStatus)
+                             RequestStatus, TokenRateLimiter)
 
 logger = init_logger(__name__)
 
@@ -84,6 +85,13 @@ class Scheduler:
         self.mlfq_queues: List[Deque[Request]] = [
             deque() for _ in range(MLFQ_NUM_LEVELS)
         ]
+
+        # ---- Token Rate Limiting (Token Bucket) ----
+        # When enabled, running requests are rate-limited based on their
+        # priority.  High-priority requests are not limited; low-priority
+        # requests are throttled under load so that token_budget is freed
+        # for high-priority requests.
+        self.enable_token_rate_limiting: bool = True
         # The requests that have been scheduled and are being executed
         # by the executor.
         self.scheduled_req_ids: Set[str] = set()
@@ -155,6 +163,10 @@ class Scheduler:
         if self.enable_qos_priority:
             self._update_effective_priorities()
 
+        # ---- Token Rate Limiting: Refill buckets & adjust rates ----
+        if self.enable_token_rate_limiting:
+            self._update_rate_limiters()
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -168,6 +180,21 @@ class Scheduler:
                               request.num_computed_tokens)
             num_new_tokens = min(num_new_tokens, token_budget)
             assert num_new_tokens > 0
+
+            # ---- Token Rate Limiting ----
+            # Apply per-request rate limiting for running requests.
+            # High-priority requests are not limited; low-priority requests
+            # may have their num_new_tokens reduced.
+            if (self.enable_token_rate_limiting
+                    and request.rate_limiter.is_limited()):
+                allowed = request.rate_limiter.consume(num_new_tokens)
+                if allowed < num_new_tokens and allowed > 0:
+                    num_new_tokens = allowed
+                elif allowed == 0:
+                    # Bucket is empty — skip this request this step.
+                    # It will be scheduled next step when the bucket refills.
+                    req_index += 1
+                    continue
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule, num_new_tokens, new_encoder_budget = (
@@ -790,6 +817,88 @@ class Scheduler:
                     break
                 except ValueError:
                     continue
+
+    # ---- Token Rate Limiting Helper Methods ----
+
+    def _update_rate_limiters(self) -> None:
+        """Update rate limiters for all running requests based on system load.
+
+        The rate limiting strategy is:
+        - Compute system load as len(running) / max_num_running_reqs.
+        - If load < LOAD_THRESHOLD_MODERATE: no limiting (all requests run
+          at full speed, maximising throughput when system is idle).
+        - If load >= LOAD_THRESHOLD_MODERATE: start limiting low-priority
+          requests to free token_budget for high-priority ones.
+        - If load >= LOAD_THRESHOLD_HIGH: aggressively limit low-priority
+          requests.
+
+        Priority classification uses MLFQ levels (if enabled) or
+        effective_priority to determine HIGH / NORMAL / LOW tiers:
+        - HIGH:   MLFQ L0-L1, or effective_priority < 0
+        - NORMAL: MLFQ L2, or 0 <= effective_priority < 5
+        - LOW:    MLFQ L3+, or effective_priority >= 5
+        """
+        if not self.running:
+            return
+
+        load = len(self.running) / max(1, self.max_num_running_reqs)
+
+        for request in self.running:
+            rl = request.rate_limiter
+
+            # Always refill the bucket at the start of each step.
+            rl.refill()
+
+            # Determine the priority tier for this request.
+            tier = self._get_priority_tier(request)
+
+            if load < TokenRateLimiter.LOAD_THRESHOLD_MODERATE:
+                # System is idle — no rate limiting for anyone.
+                rl.set_rate(math.inf)
+            elif load < TokenRateLimiter.LOAD_THRESHOLD_HIGH:
+                # Moderate load — limit low-priority requests.
+                if tier == "HIGH":
+                    rl.set_rate(math.inf)
+                elif tier == "NORMAL":
+                    rl.set_rate(TokenRateLimiter.DEFAULT_RATE_NORMAL)
+                else:  # LOW
+                    rl.set_rate(TokenRateLimiter.DEFAULT_RATE_LOW)
+            else:
+                # High load — aggressive limiting.
+                if tier == "HIGH":
+                    rl.set_rate(math.inf)
+                elif tier == "NORMAL":
+                    # Under high load, normal requests also get limited,
+                    # but less aggressively than low-priority ones.
+                    rl.set_rate(TokenRateLimiter.DEFAULT_RATE_LOW * 2)
+                else:  # LOW
+                    # Very aggressive: half of default low rate.
+                    rl.set_rate(max(1.0, TokenRateLimiter.DEFAULT_RATE_LOW / 2))
+
+    def _get_priority_tier(self, request: Request) -> str:
+        """Classify a request into HIGH / NORMAL / LOW priority tier.
+
+        Uses MLFQ level (if enabled) as the primary signal, with
+        effective_priority as fallback.
+        """
+        if self.enable_mlfq:
+            if request.mlfq_level <= 1:
+                return "HIGH"
+            elif request.mlfq_level == 2:
+                return "NORMAL"
+            else:
+                return "LOW"
+        elif self.enable_qos_priority:
+            ep = request.effective_priority
+            if ep < 0:
+                return "HIGH"
+            elif ep < 5:
+                return "NORMAL"
+            else:
+                return "LOW"
+        else:
+            # No priority information — treat all as HIGH (no limiting).
+            return "HIGH"
 
     def get_num_unfinished_requests(self) -> int:
         return len(self.waiting) + len(self.running)
