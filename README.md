@@ -330,7 +330,7 @@
 
 ---
 
-### 优化 7：MLFQ 多级反馈队列 `[P3]` `[未实现]`
+### 优化 7：MLFQ 多级反馈队列 `[P3]` `[已实现]`
 
 > 对应能力迁移：**OS 进程调度 CFS → 多级反馈 + 自适应优先级**
 
@@ -347,21 +347,21 @@
 #### 实现细节
 
 - 修改文件：
-  - `vllm/v1/core/scheduler.py` — MLFQ 多级队列管理
-  - `vllm/v1/request.py` — 新增 MLFQ 级别状态
+  - `vllm/v1/request.py` — 新增 `MLFQLevel` 配置类、`MLFQ_LEVELS` 全局级别定义、Request 新增 `mlfq_level`/`mlfq_tokens_consumed` 字段和 `mlfq_account_tokens()`/`mlfq_promote()` 方法
+  - `vllm/v1/core/scheduler.py` — 新增 `mlfq_queues`（N 级 deque）、`_mlfq_peek_next()`/`_mlfq_pop_next()`/`_mlfq_remove_from_level()` 辅助方法；调度循环从最高级队列优先取请求；抢占时调用 `mlfq_promote()` 升级；`update_from_output()` 中调用 `mlfq_account_tokens()` 实现自动降级
 - 核心逻辑：
-  1. **多级队列**：定义 N 个优先级级别（如 4 级），每级有不同的 token 配额（时间片）：
+  1. **多级队列**：定义 4 个优先级级别，每级有不同的 token 配额（时间片）：
      ```python
-     LEVELS = [
-         {"quota": 128,  "name": "interactive"},   # L0: 短对话
-         {"quota": 512,  "name": "standard"},       # L1: 普通请求
-         {"quota": 2048, "name": "batch"},           # L2: 长请求
-         {"quota": inf,  "name": "background"},      # L3: 后台任务
+     MLFQ_LEVELS = [
+         MLFQLevel(level=0, name="interactive", token_quota=128),    # L0: 短对话
+         MLFQLevel(level=1, name="standard",    token_quota=512),    # L1: 普通请求
+         MLFQLevel(level=2, name="batch",       token_quota=2048),   # L2: 长请求
+         MLFQLevel(level=3, name="background",  token_quota=inf),    # L3: 后台任务
      ]
      ```
-  2. **降级规则**：请求在当前级别累计消耗的 token 超过该级配额后，降到下一级
-  3. **升级规则**：被抢占的请求回到原级或升一级（防止饿死）
-  4. **调度顺序**：从 L0 开始，当前级别有请求则优先调度，级别内 FCFS
+  2. **降级规则**：请求在当前级别累计消耗的 output token 超过该级配额后，自动降到下一级（`mlfq_account_tokens()`）
+  3. **升级规则**：被抢占的请求升一级（`mlfq_promote()`），防止饿死；token 消耗计数不重置，防止反复抢占刷级
+  4. **调度顺序**：从 L0 开始扫描，当前级别有请求则优先调度，级别内 FCFS
 
 #### 预期效果
 
@@ -634,7 +634,7 @@
 | 4. Token 限速 | P1 | 🔲 未实现 | `vllm/v1/core/scheduler.py`, `vllm/v1/request.py` | 令牌桶 / 漏桶限速 |
 | 5. Deadline/EDF 调度 | P2 | 🔲 未实现 | `vllm/v1/request.py`, `vllm/v1/core/scheduler.py`, `vllm/v1/engine/processor.py` | EDF + fq_codel / HFSC |
 | 6. WFQ 公平调度 | P2 | 🔲 未实现 | `vllm/v1/core/scheduler.py`, `vllm/v1/request.py`, 新增 `vllm/v1/core/tenant_manager.py` | WFQ / DRR + per-tenant 配额 |
-| 7. MLFQ 多级反馈 | P3 | 🔲 未实现 | `vllm/v1/core/scheduler.py`, `vllm/v1/request.py` | OS MLFQ / CFS |
+| 7. MLFQ 多级反馈 | P3 | ✅ 已实现 | `vllm/v1/core/scheduler.py`, `vllm/v1/request.py` | OS MLFQ / CFS |
 | 8. KV Cache 分层存储 | P1 | 🔲 未实现 | `vllm/v1/core/kv_cache_manager.py`, `vllm/v1/core/kv_cache_utils.py`, 新增 `vllm/v1/core/block_migrator.py` | 存储热温冷分层 + 预取 |
 
 ## 项目亮点
@@ -699,4 +699,4 @@ python benchmarks/qos_benchmark.py --baseline --optimized --output results/
 - [ ] 优化 4：Token 级速率控制（P1）
 - [ ] 优化 5：Deadline/EDF 调度（P2）
 - [ ] 优化 6：WFQ 加权公平调度（P2）
-- [ ] 优化 7：MLFQ 多级反馈队列（P3）
+- [x] 优化 7：MLFQ 多级反馈队列（P3）
