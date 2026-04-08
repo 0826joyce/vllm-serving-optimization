@@ -272,6 +272,10 @@ class KVCacheManager:
         When caching is enabled, we free the blocks in reverse order so that
         the tail blocks are evicted first.
 
+        Segmented LRU integration: blocks that were previously cache-hit
+        (``_promoted == True``) are placed into the protected zone instead
+        of probation, giving them higher eviction resistance.
+
         Args:
             request: The request to free the blocks.
         """
@@ -286,7 +290,13 @@ class KVCacheManager:
         for block in ordered_blocks:
             block.decr_ref()
             if block.ref_cnt == 0:
-                self.free_block_queue.append(block)
+                if block._promoted:
+                    # This block was cache-hit before; place it in the
+                    # protected zone for higher eviction resistance.
+                    self.free_block_queue.append_protected(block)
+                    block._promoted = False
+                else:
+                    self.free_block_queue.append(block)
 
         self.num_cached_block.pop(request.request_id, None)
 
@@ -443,6 +453,11 @@ class KVCacheManager:
         the block from the free queue. This is used when a block is hit by
         another request with the same prefix.
 
+        When Segmented LRU is enabled, a cache hit on a free block marks it
+        as ``_promoted``.  When the block is later freed again (ref_cnt → 0),
+        it will enter the protected zone instead of probation, giving it
+        higher eviction resistance.
+
         Args:
             blocks: A list of blocks to touch.
         """
@@ -450,6 +465,8 @@ class KVCacheManager:
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
             if block.ref_cnt == 0:
+                # Mark for protected-zone placement on next free().
+                block._promoted = True
                 self.free_block_queue.remove(block)
             block.incr_ref()
 
