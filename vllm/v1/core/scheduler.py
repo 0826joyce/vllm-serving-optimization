@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import heapq
+import itertools
 import math
 import time
 from collections import deque
@@ -85,6 +86,20 @@ class Scheduler:
         self.mlfq_queues: List[Deque[Request]] = [
             deque() for _ in range(MLFQ_NUM_LEVELS)
         ]
+
+        # ---- Cache-Aware Scheduling ----
+        # When enabled (and prefix caching is on), the scheduler scans the
+        # top-K candidates within the same MLFQ level and re-orders them
+        # by actual prefill tokens (ascending), so requests with higher
+        # cache hit rates are scheduled first, maximising token_budget
+        # utilisation and reducing TTFT.
+        self.enable_cache_aware_scheduling: bool = (
+            self.cache_config.enable_prefix_caching)
+        # Number of candidates to scan within each MLFQ level for
+        # cache-aware reordering.  Larger values give better ordering but
+        # increase per-step overhead (one get_computed_blocks call per
+        # candidate).
+        self.cache_aware_scan_window: int = 8
 
         # ---- Token Rate Limiting (Token Bucket) ----
         # When enabled, running requests are rate-limited based on their
@@ -293,17 +308,37 @@ class Scheduler:
             assert len(requested_loras) <= self.lora_config.max_loras
 
         # Next, schedule the WAITING requests.
+        # ---- Cache-Aware Scheduling (Optimization 1) ----
+        # When enabled, instead of pure FCFS within each MLFQ level, we
+        # scan the top-K candidates and reorder them by actual prefill
+        # tokens (ascending).  Requests with more cache hits need fewer
+        # new tokens and are therefore scheduled first, maximising
+        # token_budget utilisation and reducing TTFT.
         if not preempted_reqs:
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
-                if self.enable_mlfq:
+                # --- Select the next candidate (cache-aware or FCFS) ---
+                if (self.enable_cache_aware_scheduling
+                        and self.enable_mlfq):
+                    # Cache-aware selection: scan top-K candidates in the
+                    # highest non-empty MLFQ level, pick the one with the
+                    # fewest actual prefill tokens.
+                    selection = self._cache_aware_select_next()
+                    if selection is None:
+                        break
+                    (request, computed_blocks,
+                     num_computed_tokens) = selection
+                    cache_info_precomputed = True
+                elif self.enable_mlfq:
                     request = self._mlfq_peek_next()
                     if request is None:
                         break
+                    cache_info_precomputed = False
                 else:
                     request = self.waiting[0]
+                    cache_info_precomputed = False
 
                 # Check that adding the request still respects the max_loras
                 # constraint.
@@ -321,9 +356,10 @@ class Scheduler:
                         # This is too conservative and could be optimized.
                         break
 
-                # Get already-cached tokens.
-                computed_blocks, num_computed_tokens = \
-                    self.kv_cache_manager.get_computed_blocks(request)
+                if not cache_info_precomputed:
+                    # Get already-cached tokens (original path).
+                    computed_blocks, num_computed_tokens = \
+                        self.kv_cache_manager.get_computed_blocks(request)
                 # Number of tokens to be scheduled.
                 # We use `request.num_tokens` instead of
                 # `request.num_prompt_tokens` to consider the resumed requests,
@@ -359,7 +395,7 @@ class Scheduler:
                     break
 
                 if self.enable_mlfq:
-                    self._mlfq_pop_next()
+                    self.mlfq_queues[request.mlfq_level].remove(request)
                     self.waiting.remove(request)
                 else:
                     self.waiting.popleft()
@@ -817,6 +853,54 @@ class Scheduler:
                     break
                 except ValueError:
                     continue
+
+    # ---- Cache-Aware Scheduling Helper Methods ----
+
+    def _cache_aware_select_next(
+        self,
+    ) -> Optional[Tuple[Request, List, int]]:
+        """Select the next WAITING request using cache-aware ordering.
+
+        Within the highest non-empty MLFQ level, scan up to
+        ``cache_aware_scan_window`` candidates and return the one that
+        requires the fewest new prefill tokens (i.e. highest cache hit
+        rate).  This maximises the number of requests that fit within the
+        remaining token_budget.
+
+        The method calls ``get_computed_blocks()`` for each scanned
+        candidate.  ``get_computed_blocks()`` is safe to call multiple
+        times — it only computes and caches block hashes, it does NOT
+        modify reference counts.
+
+        Returns:
+            A tuple of (request, computed_blocks, num_computed_tokens)
+            for the best candidate, or None if all levels are empty.
+        """
+        for level_queue in self.mlfq_queues:
+            if not level_queue:
+                continue
+
+            # Take up to K candidates from this level (without removing
+            # them from the queue).
+            k = min(self.cache_aware_scan_window, len(level_queue))
+            candidates = list(itertools.islice(level_queue, k))
+
+            best: Optional[Tuple[int, Request, List, int]] = None
+            for req in candidates:
+                computed_blocks, num_computed_tokens = (
+                    self.kv_cache_manager.get_computed_blocks(req))
+                actual_prefill = req.num_tokens - num_computed_tokens
+                if best is None or actual_prefill < best[0]:
+                    best = (actual_prefill, req, computed_blocks,
+                            num_computed_tokens)
+
+            if best is not None:
+                _, req, comp_blocks, n_computed = best
+                return (req, comp_blocks, n_computed)
+            # Should not reach here since level_queue is non-empty,
+            # but fall through to the next level just in case.
+
+        return None
 
     # ---- Token Rate Limiting Helper Methods ----
 
