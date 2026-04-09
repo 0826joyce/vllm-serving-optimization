@@ -33,6 +33,7 @@ from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
 from vllm.v1.outputs import LogprobsTensors, ModelRunnerOutput
 from vllm.v1.sample.rejection_sampler import INVALID_TOKEN_ID
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+from vllm.v1.spec_decode.suffix_proposer import SuffixTreeProposer
 from vllm.v1.utils import bind_kv_cache
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
@@ -126,8 +127,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert self.speculative_config.ngram_prompt_lookup_min, \
                     "Currently, only ngram spec decode is supported in V1."
             if get_pp_group().is_last_rank:
-                self.drafter = NgramProposer()
-                # Trigger Numba JIT compilation for N-gram proposer.
+                import os
+                proposer_type = os.environ.get(
+                    "VLLM_SPEC_PROPOSER", "ngram").lower()
+                if proposer_type == "suffix":
+                    logger.info(
+                        "Using SuffixTreeProposer for speculative decoding.")
+                    self.drafter = SuffixTreeProposer()
+                else:
+                    logger.info(
+                        "Using NgramProposer for speculative decoding.")
+                    self.drafter = NgramProposer()
+                # Trigger Numba JIT compilation for the proposer.
                 # This usually takes less than 1 second.
                 self.drafter.propose(
                     np.zeros(1024, dtype=np.int32),
