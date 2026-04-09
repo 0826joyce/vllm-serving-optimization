@@ -300,6 +300,65 @@ class KVCacheManager:
 
         self.num_cached_block.pop(request.request_id, None)
 
+    def free_partial(self, request: Request,
+                     keep_prefix_blocks: int) -> int:
+        """Partially free blocks for a preempted request.
+
+        Only tail blocks (beyond *keep_prefix_blocks*) are released.
+        The retained prefix blocks keep ``ref_cnt > 0`` so they remain
+        protected from eviction, benefiting both this request's future
+        resume and other requests sharing the same prefix.
+
+        ``req_to_blocks`` is updated to contain only the kept blocks;
+        ``req_to_block_hashes`` is NOT trimmed because it caches the
+        hash chain and will be reused on the next ``get_computed_blocks``
+        call when the request resumes.
+
+        Args:
+            request: The preempted request.
+            keep_prefix_blocks: Number of head blocks to retain
+                (ref_cnt stays unchanged).
+
+        Returns:
+            The number of blocks actually freed.
+        """
+        blocks = self.req_to_blocks.get(request.request_id)
+        if not blocks:
+            return 0
+
+        keep_prefix_blocks = max(0, min(keep_prefix_blocks, len(blocks)))
+        freed_blocks = blocks[keep_prefix_blocks:]
+        kept_blocks = blocks[:keep_prefix_blocks]
+
+        # Release tail blocks in reverse order (same convention as free()).
+        ordered: Iterable[KVCacheBlock] = freed_blocks
+        if self.enable_caching:
+            ordered = reversed(freed_blocks)
+
+        for block in ordered:
+            block.decr_ref()
+            if block.ref_cnt == 0:
+                if block._promoted:
+                    self.free_block_queue.append_protected(block)
+                    block._promoted = False
+                else:
+                    self.free_block_queue.append(block)
+
+        if kept_blocks:
+            self.req_to_blocks[request.request_id] = kept_blocks
+        else:
+            self.req_to_blocks.pop(request.request_id, None)
+
+        # Update num_cached_block to not exceed the kept blocks count.
+        prev_cached = self.num_cached_block.get(request.request_id, 0)
+        if keep_prefix_blocks > 0:
+            self.num_cached_block[request.request_id] = min(
+                prev_cached, keep_prefix_blocks)
+        else:
+            self.num_cached_block.pop(request.request_id, None)
+
+        return len(freed_blocks)
+
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
         flows to invalid prefix caching after the weights are updated,
