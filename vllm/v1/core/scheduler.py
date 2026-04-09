@@ -107,6 +107,15 @@ class Scheduler:
         # requests are throttled under load so that token_budget is freed
         # for high-priority requests.
         self.enable_token_rate_limiting: bool = True
+
+        # ---- Preemption Cache Shield ----
+        # Minimum number of blocks that a partial free must release.
+        # If partial free would release fewer blocks than this threshold,
+        # fall back to full free to guarantee forward progress in the
+        # preemption loop.  Setting to 1 means "partial free must release
+        # at least 1 block to be worthwhile".
+        self._PREEMPT_MIN_FREE_BLOCKS: int = 1
+
         # The requests that have been scheduled and are being executed
         # by the executor.
         self.scheduled_req_ids: Set[str] = set()
@@ -244,9 +253,40 @@ class Scheduler:
                     else:
                         # FCFS fallback: preempt last added (LIFO).
                         preempted_req = self.running.pop()
-                    self.kv_cache_manager.free(preempted_req)
+                    # --- Preemption Cache Shield (Optimization 3) ---
+                    # Instead of fully freeing all blocks, retain the
+                    # prefix blocks that have a block_hash (cacheable).
+                    # This protects high-value prefix blocks from eviction
+                    # and allows faster resume via get_computed_blocks().
+                    #
+                    # Fallback: if partial free would release too few
+                    # blocks (fewer than _PREEMPT_MIN_FREE_BLOCKS),
+                    # fall back to full free to guarantee forward
+                    # progress in the preemption loop.
+                    preempt_blocks = self.kv_cache_manager.req_to_blocks.get(
+                        preempted_req.request_id, [])
+                    keep_count = 0
+                    if self.kv_cache_manager.enable_caching:
+                        for blk in preempt_blocks:
+                            if blk.block_hash is not None:
+                                keep_count += 1
+                            else:
+                                break
+                    would_free = len(preempt_blocks) - keep_count
+                    if (keep_count > 0
+                            and would_free
+                            >= self._PREEMPT_MIN_FREE_BLOCKS):
+                        self.kv_cache_manager.free_partial(
+                            preempted_req, keep_count)
+                        preempted_req.num_computed_tokens = (
+                            keep_count * self.block_size)
+                    else:
+                        # Either no cacheable prefix, or partial free
+                        # would release too few blocks — full free to
+                        # ensure the preemption loop makes progress.
+                        self.kv_cache_manager.free(preempted_req)
+                        preempted_req.num_computed_tokens = 0
                     preempted_req.status = RequestStatus.PREEMPTED
-                    preempted_req.num_computed_tokens = 0
 
                     if self.enable_mlfq:
                         # MLFQ: promote preempted request by one level
