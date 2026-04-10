@@ -33,6 +33,8 @@ from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
 from vllm.v1.outputs import LogprobsTensors, ModelRunnerOutput
 from vllm.v1.sample.rejection_sampler import INVALID_TOKEN_ID
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+from vllm.v1.spec_decode.suffix_automaton_proposer import (
+    SuffixAutomatonProposer)
 from vllm.v1.spec_decode.suffix_proposer import SuffixTreeProposer
 from vllm.v1.utils import bind_kv_cache
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
@@ -130,7 +132,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 import os
                 proposer_type = os.environ.get(
                     "VLLM_SPEC_PROPOSER", "ngram").lower()
-                if proposer_type == "suffix":
+                if proposer_type == "suffix_automaton":
+                    logger.info(
+                        "Using SuffixAutomatonProposer for speculative "
+                        "decoding (incremental SAM).")
+                    self.drafter = SuffixAutomatonProposer()
+                elif proposer_type == "suffix":
                     logger.info(
                         "Using SuffixTreeProposer for speculative decoding.")
                     self.drafter = SuffixTreeProposer()
@@ -138,13 +145,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     logger.info(
                         "Using NgramProposer for speculative decoding.")
                     self.drafter = NgramProposer()
-                # Trigger Numba JIT compilation for the proposer.
+                # Trigger JIT compilation / warmup for the proposer.
                 # This usually takes less than 1 second.
-                self.drafter.propose(
-                    np.zeros(1024, dtype=np.int32),
-                    self.speculative_config.ngram_prompt_lookup_min,
-                    self.speculative_config.num_speculative_tokens,
-                )
+                if isinstance(self.drafter, SuffixAutomatonProposer):
+                    self.drafter.propose(
+                        np.zeros(1024, dtype=np.int32),
+                        self.speculative_config.ngram_prompt_lookup_min,
+                        self.speculative_config.num_speculative_tokens,
+                        req_id="__warmup__",
+                    )
+                    self.drafter.remove_request("__warmup__")
+                else:
+                    self.drafter.propose(
+                        np.zeros(1024, dtype=np.int32),
+                        self.speculative_config.ngram_prompt_lookup_min,
+                        self.speculative_config.num_speculative_tokens,
+                    )
 
         # Request states.
         self.requests: Dict[str, CachedRequestState] = {}
@@ -257,6 +273,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.encoder_cache.pop(req_id, None)
+            # Clean up per-request SAM state if using SuffixAutomatonProposer.
+            if (self.use_spec_decode
+                    and isinstance(self.drafter, SuffixAutomatonProposer)):
+                self.drafter.remove_request(req_id)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -1034,6 +1054,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> List[List[int]]:
         # TODO(woosuk): Optimize.
         draft_token_ids: List[List[int]] = []
+        use_sam = isinstance(self.drafter, SuffixAutomatonProposer)
         for i, sampled_ids in enumerate(sampled_token_ids):
             num_sampled_ids = len(sampled_ids)
             if not num_sampled_ids:
@@ -1045,11 +1066,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             start_idx = self.input_batch.num_tokens_no_spec[i]
             end_idx = start_idx + num_sampled_ids
             self.input_batch.token_ids_cpu[i, start_idx:end_idx] = sampled_ids
-            drafter_output = self.drafter.propose(
-                self.input_batch.token_ids_cpu[i, :end_idx],
-                self.speculative_config.ngram_prompt_lookup_min,
-                self.speculative_config.num_speculative_tokens,
-            )
+            if use_sam:
+                # SuffixAutomatonProposer needs req_id for stateful tracking.
+                req_id = self.input_batch.req_ids[i]
+                drafter_output = self.drafter.propose(
+                    self.input_batch.token_ids_cpu[i, :end_idx],
+                    self.speculative_config.ngram_prompt_lookup_min,
+                    self.speculative_config.num_speculative_tokens,
+                    req_id=req_id,
+                )
+            else:
+                drafter_output = self.drafter.propose(
+                    self.input_batch.token_ids_cpu[i, :end_idx],
+                    self.speculative_config.ngram_prompt_lookup_min,
+                    self.speculative_config.num_speculative_tokens,
+                )
             if drafter_output is None or len(drafter_output) == 0:
                 draft_token_ids.append([])
             else:
