@@ -7,8 +7,8 @@ import time
 from collections import deque
 from typing import Deque, Dict, Iterable, List, Optional, Set, Tuple, Union
 
-from vllm.config import (CacheConfig, LoRAConfig, ModelConfig, SchedulerConfig,
-                         SpeculativeConfig)
+from vllm.config import (CacheConfig, KVTransferConfig, LoRAConfig,
+                         ModelConfig, SchedulerConfig, SpeculativeConfig)
 from vllm.logger import init_logger
 from vllm.v1.core.encoder_cache_manager import (EncoderCacheManager,
                                                 compute_encoder_budget)
@@ -34,13 +34,31 @@ class Scheduler:
         cache_config: CacheConfig,
         lora_config: Optional[LoRAConfig],
         speculative_config: Optional[SpeculativeConfig],
-        log_stats: bool,
+        kv_transfer_config: Optional[KVTransferConfig] = None,
+        log_stats: bool = False,
     ) -> None:
         self.scheduler_config = scheduler_config
         self.cache_config = cache_config
         self.lora_config = lora_config
         self.speculative_config = speculative_config
         self.log_stats = log_stats
+
+        # ---- PD Disaggregation Role Awareness ----
+        self.kv_transfer_config = kv_transfer_config
+        self.is_kv_transfer_instance = (
+            kv_transfer_config is not None
+            and kv_transfer_config.is_kv_transfer_instance)
+        self.is_kv_producer = (
+            kv_transfer_config is not None
+            and kv_transfer_config.is_kv_producer)
+        self.is_kv_consumer = (
+            kv_transfer_config is not None
+            and kv_transfer_config.is_kv_consumer)
+
+        if self.is_kv_transfer_instance:
+            logger.info(
+                "Scheduler PD role: producer=%s, consumer=%s",
+                self.is_kv_producer, self.is_kv_consumer)
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs

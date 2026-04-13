@@ -43,6 +43,8 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 
 if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1_connector import (
+        V1KVConnector)
     from vllm.v1.core.scheduler_output import SchedulerOutput
 
 logger = init_logger(__name__)
@@ -121,6 +123,45 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.kv_caches: List[torch.Tensor] = []
         # req_id -> (input_id -> encoder_output)
         self.encoder_cache: Dict[str, Dict[int, torch.Tensor]] = {}
+
+        # ---- PD Disaggregation (KV Transfer) ----
+        self.kv_transfer_config = vllm_config.kv_transfer_config
+        self.is_kv_transfer_instance = (
+            self.kv_transfer_config is not None
+            and self.kv_transfer_config.is_kv_transfer_instance)
+        self.is_kv_producer = (
+            self.kv_transfer_config is not None
+            and self.kv_transfer_config.is_kv_producer)
+        self.is_kv_consumer = (
+            self.kv_transfer_config is not None
+            and self.kv_transfer_config.is_kv_consumer)
+        self.kv_connector: Optional["V1KVConnector"] = None
+
+        if self.is_kv_transfer_instance:
+            from vllm.distributed.kv_transfer.kv_connector.v1_connector import (
+                V1KVConnector)
+            from vllm.distributed.kv_transfer.kv_connector.factory import (
+                KVConnectorFactory)
+            logger.info(
+                "V1 GPUModelRunner: Initializing KV Transfer "
+                "(role=%s, connector=%s)",
+                self.kv_transfer_config.kv_role,
+                self.kv_transfer_config.kv_connector)
+            connector = KVConnectorFactory.create_connector(
+                rank=0,  # Will be updated in init_device
+                local_rank=0,
+                config=vllm_config,
+            )
+            if isinstance(connector, V1KVConnector):
+                self.kv_connector = connector
+            else:
+                logger.warning(
+                    "KV connector %s is not V1-compatible. "
+                    "PD disaggregation will be disabled.",
+                    type(connector).__name__)
+                self.is_kv_transfer_instance = False
+                self.is_kv_producer = False
+                self.is_kv_consumer = False
 
         # Set up speculative decoding.
         self.use_spec_decode = False
@@ -912,6 +953,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> Union[ModelRunnerOutput, torch.Tensor]:
         self._update_states(scheduler_output)
 
+        # ---- PD Disaggregation: KV Consumer (Decode instance) ----
+        # Before running the model, attempt to receive KV caches for
+        # prefill requests from the Prefill instance.
+        bypass_model_exec = False
+        kv_recv_success_map: Dict[str, bool] = {}
+        if self.is_kv_consumer and self.kv_connector is not None:
+            bypass_model_exec, kv_recv_success_map = (
+                self._recv_kv_caches_for_consumer(scheduler_output))
+
         if self.is_multimodal_model:
             # Run the multimodal encoder if any.
             self._execute_encoder(scheduler_output)
@@ -972,22 +1022,39 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 for k, v in self.intermediate_tensors.items()
             })
 
-        # Run the decoder.
-        # Use persistent buffers for CUDA graphs.
-        with set_forward_context(attn_metadata, self.vllm_config):
-            hidden_states = self.model(
-                input_ids=input_ids,
-                positions=positions,
-                kv_caches=self.kv_caches,
-                attn_metadata=None,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-            )
+        # ---- PD Disaggregation: Skip forward if all KV received ----
+        if not bypass_model_exec:
+            # Run the decoder.
+            # Use persistent buffers for CUDA graphs.
+            with set_forward_context(attn_metadata, self.vllm_config):
+                hidden_states = self.model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    kv_caches=self.kv_caches,
+                    attn_metadata=None,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                )
+        else:
+            # All requests had their KV caches received from the Prefill
+            # instance. We bypass the forward pass entirely.
+            # Create dummy hidden states for sampling.
+            logger.debug("V1 PD: Bypassing model forward — all KV received.")
+            hidden_states = torch.zeros(
+                num_input_tokens, self.hidden_size,
+                dtype=self.dtype, device=self.device)
+
         if not get_pp_group().is_last_rank:
             # For mid-pipeline stages, return the hidden states.
             return hidden_states
 
         hidden_states = hidden_states[:num_scheduled_tokens]
+
+        # ---- PD Disaggregation: KV Producer (Prefill instance) ----
+        # After the forward pass, send KV caches to the Decode instance.
+        if self.is_kv_producer and self.kv_connector is not None:
+            self._send_kv_caches_for_producer(scheduler_output, hidden_states)
+
         sample_hidden_states = hidden_states[logits_indices]
         logits = self.model.compute_logits(sample_hidden_states, None)
 
@@ -1106,6 +1173,188 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             else:
                 draft_token_ids.append(drafter_output.tolist())
         return draft_token_ids
+
+    # ------------------------------------------------------------------
+    # PD Disaggregation: KV Cache Send/Recv Helpers
+    # ------------------------------------------------------------------
+
+    def _has_prefill_requests(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> bool:
+        """Check if the current batch contains any prefill requests.
+
+        In V1, a request is in "prefill" if its num_computed_tokens
+        has not yet reached num_tokens (prompt_token_ids length).
+        """
+        for req_id in scheduler_output.num_scheduled_tokens:
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                # New request — definitely prefill
+                return True
+            if req_state.num_computed_tokens < req_state.num_tokens:
+                return True
+        return False
+
+    def _recv_kv_caches_for_consumer(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> Tuple[bool, Dict[str, bool]]:
+        """Attempt to receive KV caches for prefill requests from
+        the Prefill (producer) instance.
+
+        For each new prefill request, try to receive its KV cache
+        from the consumer buffer. If successful, mark the request's
+        KV cache as fully computed so the forward pass can be skipped.
+
+        Args:
+            scheduler_output: The current scheduler output.
+
+        Returns:
+            A tuple of:
+              - bypass_model_exec: True if ALL requests' KV were received.
+              - kv_recv_success_map: req_id -> whether KV was received.
+        """
+        assert self.kv_connector is not None
+
+        kv_recv_success_map: Dict[str, bool] = {}
+        all_received = True
+
+        # Only attempt to receive KV for prefill requests (new requests).
+        for new_req_data in scheduler_output.scheduled_new_reqs:
+            req_id = new_req_data.req_id
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                # Not yet in cache — this is a brand new request.
+                # We need to wait until _update_states has been called.
+                # Since _update_states is called before us in execute_model,
+                # try again.
+                req_state = self.requests.get(req_id)
+                if req_state is None:
+                    kv_recv_success_map[req_id] = False
+                    all_received = False
+                    continue
+
+            # Build the input tokens tensor for the request.
+            num_tokens = req_state.num_tokens
+            input_tokens = torch.tensor(
+                req_state.prompt_token_ids[:num_tokens],
+                dtype=torch.int32, device=self.device)
+
+            success, num_recv_tokens, hidden = self.kv_connector.recv_kv_caches_v1(
+                req_id=req_id,
+                input_tokens=input_tokens,
+                kv_caches=self.kv_caches,
+                block_ids=req_state.block_ids,
+                block_size=self.block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                num_layers=self.num_attn_layers,
+            )
+
+            kv_recv_success_map[req_id] = success
+            if success and num_recv_tokens == num_tokens:
+                # All KV received — update num_computed_tokens to skip prefill.
+                req_state.num_computed_tokens = num_recv_tokens
+                self.input_batch.num_computed_tokens_cpu[
+                    self.input_batch.req_id_to_index[req_id]] = num_recv_tokens
+                logger.debug(
+                    "V1 PD Consumer: req_id=%s, received %d tokens — "
+                    "skipping prefill", req_id, num_recv_tokens)
+            else:
+                all_received = False
+                if success:
+                    logger.debug(
+                        "V1 PD Consumer: req_id=%s, partial recv %d/%d — "
+                        "fallback to prefill", req_id, num_recv_tokens,
+                        num_tokens)
+                else:
+                    logger.debug(
+                        "V1 PD Consumer: req_id=%s, no KV found — "
+                        "fallback to prefill", req_id)
+
+        # Also check cached (running) requests that are still prefilling
+        for cached_req_data in scheduler_output.scheduled_cached_reqs:
+            req_id = cached_req_data.req_id
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                continue
+            if req_state.num_computed_tokens < req_state.num_tokens:
+                # This is a prefill request still in progress.
+                # For basic 1P1D, we don't attempt recv for ongoing prefills.
+                all_received = False
+
+        return all_received, kv_recv_success_map
+
+    def _send_kv_caches_for_producer(
+        self,
+        scheduler_output: "SchedulerOutput",
+        hidden_states: torch.Tensor,
+    ) -> None:
+        """Send KV caches for completed prefill requests to the
+        Decode (consumer) instance.
+
+        For each request that has just finished its prefill (or a chunk
+        of prefill), send the KV cache data through the producer buffer.
+
+        Args:
+            scheduler_output: The current scheduler output.
+            hidden_states: The hidden states from the forward pass.
+        """
+        assert self.kv_connector is not None
+
+        # Track position offsets for extracting hidden states per request.
+        offset = 0
+
+        for i, req_id in enumerate(self.input_batch.req_ids):
+            if req_id not in scheduler_output.num_scheduled_tokens:
+                continue
+
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                continue
+
+            num_scheduled = scheduler_output.num_scheduled_tokens[req_id]
+            seq_len = req_state.num_computed_tokens + num_scheduled
+
+            # Only send KV for requests that have prefill tokens scheduled.
+            # In V1, a request is prefilling if num_computed_tokens < num_tokens.
+            is_prefill = (req_state.num_computed_tokens < req_state.num_tokens)
+            if not is_prefill:
+                offset += num_scheduled
+                continue
+
+            # Build input tokens for the request.
+            all_token_ids = list(req_state.prompt_token_ids)
+            all_token_ids.extend(req_state.output_token_ids)
+            num_tokens = min(seq_len, len(all_token_ids))
+            input_tokens = torch.tensor(
+                all_token_ids[:num_tokens],
+                dtype=torch.int32, device=self.device)
+
+            # Extract hidden states for this request.
+            req_hidden = hidden_states[offset:offset + num_scheduled]
+
+            self.kv_connector.send_kv_caches_v1(
+                req_id=req_id,
+                input_tokens=input_tokens,
+                kv_caches=self.kv_caches,
+                block_ids=req_state.block_ids,
+                num_computed_tokens=req_state.num_computed_tokens,
+                num_new_tokens=num_scheduled,
+                block_size=self.block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                num_layers=self.num_attn_layers,
+                hidden_states=req_hidden,
+            )
+            logger.debug(
+                "V1 PD Producer: req_id=%s, sent %d tokens "
+                "(computed=%d, scheduled=%d)",
+                req_id, num_tokens, req_state.num_computed_tokens,
+                num_scheduled)
+
+            offset += num_scheduled
 
     def load_model(self) -> None:
         logger.info("Starting to load model %s...", self.model_config.model)

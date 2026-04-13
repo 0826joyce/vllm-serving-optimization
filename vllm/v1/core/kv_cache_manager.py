@@ -621,3 +621,63 @@ class KVCacheManager:
         is finished, not when it is preempted.
         """
         self.req_to_block_hashes.pop(request.request_id, None)
+
+    # ------------------------------------------------------------------
+    # PD Disaggregation: Register received KV blocks
+    # ------------------------------------------------------------------
+
+    def register_received_blocks(
+        self,
+        request: Request,
+        num_received_tokens: int,
+    ) -> None:
+        """Register KV blocks received from a Prefill instance into the
+        prefix cache.
+
+        When acting as a KV consumer (Decode instance), this method is
+        called after KV data has been written into the paged KV cache.
+        It registers the block hashes so that:
+        1. The Decode instance's prefix cache is updated.
+        2. Future requests with the same prefix can hit the cache.
+
+        This method computes the block hashes using the same hash_chain
+        algorithm as the local prefix cache, ensuring consistency.
+
+        Args:
+            request: The request whose KV blocks were received.
+            num_received_tokens: Number of tokens received.
+        """
+        if not self.enable_caching:
+            return
+
+        req_id = request.request_id
+        req_blocks = self.req_to_blocks.get(req_id)
+        if not req_blocks:
+            return
+
+        # Compute block hashes for received blocks using the standard
+        # hash_chain algorithm.
+        block_hashes = self.req_to_block_hashes[req_id]
+        if not block_hashes:
+            block_hashes = hash_request_tokens(self.block_size, request)
+            self.req_to_block_hashes[req_id] = block_hashes
+
+        # Register each full block into the prefix cache.
+        num_full_blocks = num_received_tokens // self.block_size
+        num_already_cached = self.num_cached_block.get(req_id, 0)
+
+        for blk_idx in range(num_already_cached, num_full_blocks):
+            if blk_idx >= len(req_blocks) or blk_idx >= len(block_hashes):
+                break
+
+            block = req_blocks[blk_idx]
+            block_hash = block_hashes[blk_idx]
+
+            # Only register if the block doesn't already have a hash.
+            if block.block_hash is None:
+                block.block_hash = block_hash
+                self.cached_block_hash_to_block[block_hash][
+                    block.block_id] = block
+
+        self.num_cached_block[req_id] = max(
+            num_already_cached, num_full_blocks)
