@@ -32,6 +32,8 @@ from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheSpec)
 from vllm.v1.outputs import LogprobsTensors, ModelRunnerOutput
 from vllm.v1.sample.rejection_sampler import INVALID_TOKEN_ID
+from vllm.v1.spec_decode.adaptive_suffix_proposer import (
+    AdaptiveSuffixProposer)
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.spec_decode.suffix_automaton_proposer import (
     SuffixAutomatonProposer)
@@ -132,7 +134,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 import os
                 proposer_type = os.environ.get(
                     "VLLM_SPEC_PROPOSER", "ngram").lower()
-                if proposer_type == "suffix_automaton":
+                if proposer_type == "adaptive":
+                    logger.info(
+                        "Using AdaptiveSuffixProposer for speculative "
+                        "decoding (multi-candidate scoring).")
+                    self.drafter = AdaptiveSuffixProposer()
+                elif proposer_type == "suffix_automaton":
                     logger.info(
                         "Using SuffixAutomatonProposer for speculative "
                         "decoding (incremental SAM).")
@@ -147,6 +154,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.drafter = NgramProposer()
                 # Trigger JIT compilation / warmup for the proposer.
                 # This usually takes less than 1 second.
+                # AdaptiveSuffixProposer inherits from SuffixAutomatonProposer
+                # so isinstance check covers both.
                 if isinstance(self.drafter, SuffixAutomatonProposer):
                     self.drafter.propose(
                         np.zeros(1024, dtype=np.int32),
@@ -1055,6 +1064,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # TODO(woosuk): Optimize.
         draft_token_ids: List[List[int]] = []
         use_sam = isinstance(self.drafter, SuffixAutomatonProposer)
+        use_adaptive = isinstance(self.drafter, AdaptiveSuffixProposer)
         for i, sampled_ids in enumerate(sampled_token_ids):
             num_sampled_ids = len(sampled_ids)
             if not num_sampled_ids:
@@ -1062,12 +1072,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 draft_token_ids.append([])
                 continue
 
+            # Feed acceptance feedback to AdaptiveSuffixProposer.
+            # num_sampled_ids = num_accepted_draft + 1 (bonus token)
+            # So num_accepted = num_sampled_ids - 1
+            if (use_adaptive and num_sampled_ids > 1
+                    and isinstance(self.drafter, AdaptiveSuffixProposer)):
+                req_id = self.input_batch.req_ids[i]
+                self.drafter.update_acceptance(
+                    req_id, num_accepted=num_sampled_ids - 1)
+
             # Add sampled_token_ids to token_ids_cpu.
             start_idx = self.input_batch.num_tokens_no_spec[i]
             end_idx = start_idx + num_sampled_ids
             self.input_batch.token_ids_cpu[i, start_idx:end_idx] = sampled_ids
             if use_sam:
-                # SuffixAutomatonProposer needs req_id for stateful tracking.
+                # SuffixAutomatonProposer (and its subclass
+                # AdaptiveSuffixProposer) needs req_id for stateful tracking.
                 req_id = self.input_batch.req_ids[i]
                 drafter_output = self.drafter.propose(
                     self.input_batch.token_ids_cpu[i, :end_idx],
