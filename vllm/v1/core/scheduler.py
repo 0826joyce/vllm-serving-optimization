@@ -5,7 +5,8 @@ import itertools
 import math
 import time
 from collections import deque
-from typing import Deque, Dict, Iterable, List, Optional, Set, Tuple, Union
+from typing import (Deque, Dict, Iterable, List, Optional, Set, Tuple,
+                    Union)
 
 from vllm.config import (CacheConfig, KVTransferConfig, LoRAConfig,
                          ModelConfig, SchedulerConfig, SpeculativeConfig)
@@ -23,6 +24,85 @@ from vllm.v1.request import (MLFQ_LEVELS, MLFQ_NUM_LEVELS, Request,
                              RequestStatus, TokenRateLimiter)
 
 logger = init_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# KV Receive Monitor — tracks KV Cache arrival for Decode (consumer) instances
+# ---------------------------------------------------------------------------
+
+class KVReceiveMonitor:
+    """Monitor KV Cache arrival status for PD disaggregation.
+
+    In a Decode-only (consumer) instance, new requests enter the waiting
+    queue but cannot be scheduled until their KV Cache has been received
+    from the Prefill (producer) instance.  This monitor tracks which
+    requests have had their KV delivered, enabling the scheduler to make
+    event-driven decisions rather than polling.
+
+    The monitor also supports a configurable timeout: if KV has not
+    arrived within ``kv_wait_timeout_s`` seconds, the request is marked
+    as *timed-out* so the Decode instance can fall back to computing
+    the prefill locally.
+    """
+
+    # Default timeout before giving up on KV arrival (seconds).
+    DEFAULT_KV_WAIT_TIMEOUT_S: float = 30.0
+
+    def __init__(
+        self,
+        kv_wait_timeout_s: float = DEFAULT_KV_WAIT_TIMEOUT_S,
+    ) -> None:
+        # req_id -> registration timestamp (monotonic)
+        self.pending_requests: Dict[str, float] = {}
+        # req_id set for which KV has been confirmed received
+        self.received_requests: Set[str] = set()
+        self.kv_wait_timeout_s = kv_wait_timeout_s
+
+    def register_pending(self, request_id: str) -> None:
+        """Register a new request that is waiting for KV from the
+        Prefill instance."""
+        if request_id not in self.received_requests:
+            self.pending_requests[request_id] = time.monotonic()
+
+    def on_kv_received(self, request_id: str) -> None:
+        """Callback when KV Cache has been fully received for a request."""
+        self.pending_requests.pop(request_id, None)
+        self.received_requests.add(request_id)
+
+    def has_kv(self, request_id: str) -> bool:
+        """Check whether KV has been received for a request."""
+        return request_id in self.received_requests
+
+    def get_timed_out_requests(self) -> List[str]:
+        """Return request IDs whose KV wait has exceeded the timeout.
+
+        These requests should fall back to local prefill computation.
+        """
+        now = time.monotonic()
+        timed_out: List[str] = []
+        for req_id, registered_at in list(self.pending_requests.items()):
+            if now - registered_at > self.kv_wait_timeout_s:
+                timed_out.append(req_id)
+        return timed_out
+
+    def mark_timed_out(self, request_id: str) -> None:
+        """Move a timed-out request from pending to received so the
+        scheduler treats it as ready (it will do local prefill)."""
+        self.pending_requests.pop(request_id, None)
+        self.received_requests.add(request_id)
+
+    def remove(self, request_id: str) -> None:
+        """Remove tracking for a finished/aborted request."""
+        self.pending_requests.pop(request_id, None)
+        self.received_requests.discard(request_id)
+
+    @property
+    def num_pending(self) -> int:
+        return len(self.pending_requests)
+
+    @property
+    def num_received(self) -> int:
+        return len(self.received_requests)
 
 
 class Scheduler:
@@ -59,6 +139,32 @@ class Scheduler:
             logger.info(
                 "Scheduler PD role: producer=%s, consumer=%s",
                 self.is_kv_producer, self.is_kv_consumer)
+
+        # ---- PD-Aware Scheduling Configuration ----
+        # When running as a PD transfer instance, enable role-specific
+        # scheduling optimizations.
+        self.enable_pd_aware_scheduling = self.is_kv_transfer_instance
+
+        # For Prefill-only (producer) instances:
+        #   - Sort waiting requests by prompt length (shortest first) to
+        #     maximize the number of concurrent prefills within token_budget.
+        #   - Skip scheduling RUNNING requests in decode phase (they should
+        #     have been finished by _finish_prefill_only_requests in core.py).
+        self.prefill_sort_by_length = self.is_kv_producer
+
+        # For Decode-only (consumer) instances:
+        #   - Use KVReceiveMonitor to track KV arrival.
+        #   - Only schedule new requests whose KV has arrived (or timed out).
+        #   - Requests waiting for KV stay in the waiting queue but are
+        #     skipped during scheduling until KV arrives.
+        self.kv_receive_monitor: Optional[KVReceiveMonitor] = None
+        if self.is_kv_consumer:
+            kv_timeout = 30.0  # Default KV wait timeout in seconds
+            self.kv_receive_monitor = KVReceiveMonitor(
+                kv_wait_timeout_s=kv_timeout)
+            logger.info(
+                "Scheduler: KVReceiveMonitor enabled "
+                "(timeout=%.1fs)", kv_timeout)
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
@@ -208,6 +314,10 @@ class Scheduler:
         # ---- Token Rate Limiting: Refill buckets & adjust rates ----
         if self.enable_token_rate_limiting:
             self._update_rate_limiters()
+
+        # ---- PD-Aware Scheduling: Pre-processing ----
+        if self.enable_pd_aware_scheduling:
+            self._pd_aware_pre_schedule()
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -397,6 +507,21 @@ class Scheduler:
                 else:
                     request = self.waiting[0]
                     cache_info_precomputed = False
+
+                # ---- PD-Aware: Consumer KV readiness check ----
+                # On a Decode-only (consumer) instance, skip requests whose
+                # KV Cache has not arrived from the Prefill instance yet.
+                # The request stays in the waiting queue; it will be
+                # scheduled once on_kv_received() is called or after timeout
+                # (handled in _pd_aware_pre_schedule).
+                if (self.kv_receive_monitor is not None
+                        and not self.kv_receive_monitor.has_kv(
+                            request.request_id)):
+                    # KV not yet received — cannot schedule this request.
+                    # We break here because the waiting queue is ordered
+                    # and we don't want to skip ahead (FCFS guarantee
+                    # within each MLFQ level).
+                    break
 
                 # Check that adding the request still respects the max_loras
                 # constraint.
@@ -659,6 +784,16 @@ class Scheduler:
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
 
+        # ---- PD-Aware: Process KV receive results ----
+        # Notify the KVReceiveMonitor about which requests have had
+        # their KV successfully received from the Prefill instance.
+        if (self.kv_receive_monitor is not None
+                and model_runner_output.kv_recv_success_map):
+            for req_id, success in (
+                    model_runner_output.kv_recv_success_map.items()):
+                if success:
+                    self.kv_receive_monitor.on_kv_received(req_id)
+
         new_running: List[Request] = []
         outputs: List[EngineCoreOutput] = []
 
@@ -798,6 +933,11 @@ class Scheduler:
             self.waiting.append(request)
         else:
             self.waiting.append(request)
+
+        # ---- PD-Aware: Register pending KV for consumer instances ----
+        if self.kv_receive_monitor is not None:
+            self.kv_receive_monitor.register_pending(request.request_id)
+
         self.request_queued(request)
 
     def finish_requests(
@@ -838,6 +978,9 @@ class Scheduler:
         self.kv_cache_manager.free_block_hashes(request)
         self.encoder_cache_manager.free(request)
         self._cached_reqs_data.pop(request.request_id, None)
+        # ---- PD-Aware: Cleanup KV receive tracking ----
+        if self.kv_receive_monitor is not None:
+            self.kv_receive_monitor.remove(request.request_id)
         del self.requests[request.request_id]
         self.finished_req_ids.add(request.request_id)
 
@@ -867,6 +1010,88 @@ class Scheduler:
         # Update running request priorities for preemption decisions.
         for request in self.running:
             request.compute_effective_priority(now)
+
+    # ---- PD-Aware Scheduling Helper Methods ----
+
+    def _pd_aware_pre_schedule(self) -> None:
+        """Pre-scheduling hook for PD-aware optimization.
+
+        Called at the start of each schedule() step when
+        ``enable_pd_aware_scheduling`` is True.
+
+        For **Prefill-only (producer)** instances:
+          - Sort the waiting queue by prompt length (shortest first).
+            Shorter requests finish faster and free token_budget sooner,
+            allowing higher overall prefill throughput.
+
+        For **Decode-only (consumer)** instances:
+          - Check for timed-out KV waits.  If a request has been waiting
+            longer than ``kv_wait_timeout_s`` without receiving KV, mark
+            it as "received" so the scheduler treats it as ready.  The
+            execute_model recv call will see success=False and fall back
+            to local prefill (same as short-request behavior).
+        """
+        if self.is_kv_producer and self.prefill_sort_by_length:
+            self._sort_waiting_by_prompt_length()
+
+        if self.is_kv_consumer and self.kv_receive_monitor is not None:
+            self._handle_kv_timeouts()
+
+    def _sort_waiting_by_prompt_length(self) -> None:
+        """Sort the waiting queue by prompt length (shortest first).
+
+        For Prefill-only instances, this maximizes the number of requests
+        that can fit within the token_budget at each step.  Short requests
+        consume less budget, so scheduling them first allows more requests
+        to be batched together.
+
+        This interacts with MLFQ: within each MLFQ level, requests are
+        re-sorted by prompt length.
+        """
+        if self.enable_mlfq:
+            # Sort within each MLFQ level queue.
+            for level_queue in self.mlfq_queues:
+                if len(level_queue) > 1:
+                    sorted_reqs = sorted(
+                        level_queue,
+                        key=lambda r: r.num_tokens - r.num_computed_tokens)
+                    level_queue.clear()
+                    level_queue.extend(sorted_reqs)
+        else:
+            # Sort the flat waiting queue.
+            if len(self.waiting) > 1:
+                sorted_reqs = sorted(
+                    self.waiting,
+                    key=lambda r: r.num_tokens - r.num_computed_tokens)
+                self.waiting = deque(sorted_reqs)
+
+    def _handle_kv_timeouts(self) -> None:
+        """Handle timed-out KV waits for consumer instances.
+
+        Requests whose KV has not arrived within the timeout are marked
+        as "received" in the KVReceiveMonitor.  When the model runner
+        later calls recv_kv_caches_v1, it will find no data in the NCCL
+        buffer and fall back to local prefill computation — the same
+        behavior as a short request bypassing PD.
+        """
+        assert self.kv_receive_monitor is not None
+        timed_out = self.kv_receive_monitor.get_timed_out_requests()
+        for req_id in timed_out:
+            self.kv_receive_monitor.mark_timed_out(req_id)
+            logger.warning(
+                "PD Consumer: KV wait timed out for req_id=%s — "
+                "falling back to local prefill", req_id)
+
+    def notify_kv_received(self, request_id: str) -> None:
+        """External API: notify the scheduler that KV has been received
+        for a specific request.
+
+        Called by the model runner (GPUModelRunner) after
+        recv_kv_caches_v1() succeeds for a request, so the scheduler
+        knows the request is ready for decode scheduling.
+        """
+        if self.kv_receive_monitor is not None:
+            self.kv_receive_monitor.on_kv_received(request_id)
 
     # ---- MLFQ Helper Methods ----
 

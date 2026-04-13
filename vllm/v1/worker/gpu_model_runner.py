@@ -1121,6 +1121,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             spec_token_ids=spec_token_ids,
             logprobs=logprobs_lists,
             prompt_logprobs_dict=prompt_logprobs_dict,
+            kv_recv_success_map=kv_recv_success_map,
         )
         return model_runner_output
 

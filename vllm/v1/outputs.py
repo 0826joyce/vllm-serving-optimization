@@ -80,3 +80,13 @@ class ModelRunnerOutput:
     # [prompt_len, num_prompt_logprobs]
     # [prompt_len]
     prompt_logprobs_dict: Dict[str, LogprobsTensors]
+
+    # ---- PD Disaggregation ----
+    # req_id -> True if KV was successfully received from Prefill instance.
+    # Only populated on Decode (consumer) instances; empty dict otherwise.
+    # Used by the scheduler's KVReceiveMonitor to track KV arrival.
+    kv_recv_success_map: Dict[str, bool] = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.kv_recv_success_map is None:
+            self.kv_recv_success_map = {}

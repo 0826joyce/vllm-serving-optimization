@@ -706,7 +706,7 @@ curl http://localhost:8000/v1/completions \
 
 ---
 
-### 优化 3：调度器 PD 感知 `[P1]` `[未实现]`
+### 优化 3：调度器 PD 感知 `[P1]` `[已实现]`
 
 > **目标**：让 V1 调度器感知 PD 分离角色，针对 Prefill-only 和 Decode-only 场景做专门优化
 
@@ -802,6 +802,80 @@ class KVReceiveMonitor:
 - Prefill 实例：全部 token_budget 用于 Prefill，吞吐最大化
 - Decode 实例：不被 Prefill 干扰，ITL 完全稳定
 - KV 到达驱动调度，减少 Decode 端的等待时间
+
+#### 实际实现
+
+##### 改动文件清单
+
+| 文件 | 改动类型 | 说明 |
+|------|----------|------|
+| `vllm/v1/core/scheduler.py` | 修改 | 新增 KVReceiveMonitor 类 + PD 感知调度逻辑（~200行新增） |
+| `vllm/v1/outputs.py` | 修改 | ModelRunnerOutput 新增 kv_recv_success_map 字段 |
+| `vllm/v1/worker/gpu_model_runner.py` | 修改 | 填充 kv_recv_success_map 反馈给调度器 |
+| `tests/v1/core/test_pd_scheduler_awareness.py` | 新建 | 完整测试（~350行，30+ 测试用例） |
+
+##### 核心模块说明
+
+**1. `KVReceiveMonitor` — KV 到达事件跟踪**
+
+```
+新请求到达 Consumer 实例
+       │
+       ▼
+  register_pending(req_id)
+  状态: pending（等待 KV）
+       │
+       ├── KV 从 Prefill 到达 → on_kv_received(req_id)
+       │   状态: received → Scheduler 可以调度该请求
+       │
+       └── 超时（默认 30s）→ mark_timed_out(req_id)
+           状态: received → 回退到本地 Prefill
+```
+
+- **`register_pending(req_id)`**：`add_request()` 时调用，标记请求等待 KV
+- **`on_kv_received(req_id)`**：KV 接收成功后通过 `update_from_output()` 回调
+- **`has_kv(req_id)`**：`schedule()` 中检查，决定是否可以调度该请求
+- **`get_timed_out_requests()`**：每步 pre-schedule 检查超时
+- **`mark_timed_out(req_id)`**：超时后标记为 received，让 Decode 实例自行 Prefill
+- **超时安全网**：避免 Prefill 实例故障导致 Consumer 请求永远阻塞
+
+**2. Prefill-only 实例调度优化**
+
+- **短请求优先排序**：`_sort_waiting_by_prompt_length()` 在每步调度前将 waiting 队列按 prompt 长度升序排列
+- **效果**：短请求优先 Prefill → 更快释放 token_budget → 更高并发度
+- **兼容 MLFQ**：在每个 MLFQ level 内部独立排序
+
+**3. Decode-only 实例调度优化**
+
+- **KV 就绪检查**：schedule() 的 waiting 循环中，检查 `kv_receive_monitor.has_kv(req_id)`
+- **未就绪跳过**：KV 未到达的请求暂时留在 waiting 队列，不占用 token_budget
+- **超时回退**：`_handle_kv_timeouts()` 标记超时请求为 received → 下一步正常调度 → execute_model 中 recv 失败 → 自动做本地 Prefill
+
+**4. 反馈路径：ModelRunner → Scheduler**
+
+```
+execute_model() 中:
+  _recv_kv_caches_for_consumer() → kv_recv_success_map = {req_id: True/False}
+                                          │
+                                          ▼
+  ModelRunnerOutput(kv_recv_success_map=...) → 返回给 EngineCore
+                                          │
+                                          ▼
+  scheduler.update_from_output() → 遍历 kv_recv_success_map
+                                          │
+                                   success=True → kv_receive_monitor.on_kv_received(req_id)
+                                          │
+                                          ▼
+                                   下一步 schedule() 中 has_kv() 返回 True → 可调度
+```
+
+##### 与其他优化的关系
+
+| 优化 | 关系 |
+|------|------|
+| 优化1（V1 PD 基础适配） | 优化3利用优化1的 `is_kv_producer`/`is_kv_consumer` 标志和 KV recv 结果 |
+| 优化2（智能路由） | 正交——优化2在 HTTP 层做多实例路由，优化3在单实例 Scheduler 内部做 PD 感知 |
+| 优化4（传输优化） | 互补——优化3的超时机制为传输失败提供安全网 |
 
 ---
 
@@ -1233,8 +1307,8 @@ PD 分离在端到端场景中的角色：
 ## 六、实现进度追踪
 
 - [x] 优化 1：V1 引擎 PD 基础适配（P0）
-- [ ] 优化 2：智能请求路由/代理（P0）
-- [ ] 优化 3：调度器 PD 感知（P1）
+- [x] 优化 2：智能请求路由/代理（P0）
+- [x] 优化 3：调度器 PD 感知（P1）
 - [ ] 优化 4：KV Cache 传输优化（P1）
 - [ ] 优化 5：Prefix Cache 与 PD 分离协同（P2）
 - [ ] 优化 6：多实例协调与可观测性（P2）
