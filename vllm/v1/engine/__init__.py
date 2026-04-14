@@ -75,39 +75,9 @@ class EngineCoreRequest(
     sampling_params: SamplingParams | None
     pooling_params: PoolingParams | None
     arrival_time: float
-    lora_request: LoRARequest | None
-    cache_salt: str | None
-    data_parallel_rank: int | None
-    prompt_embeds: torch.Tensor | None = None
-
-    # Index of the client, used to ensure outputs are sent back to the same
-    # client for this request when scaling out the front-end.
-    client_index: int = 0
-
-    # Used in DP case to indicate which wave of requests this is expected to
-    # belong to, to cover a race condition where the request is sent before
-    # a wave finished notification is received.
-    current_wave: int = 0
-    priority: int = 0
-
-    trace_headers: Mapping[str, str] | None = None
-    resumable: bool = False
-
-    # The user-provided request ID. This field is set internally,
-    # copied from the provided request_id that's originally assigned
-    # to the request_id field, see InputProcessor.assign_request_id().
-    # Used in outputs and to support abort(req_id, internal=False).
-    external_req_id: str | None = None
-
-    reasoning_ended: bool | None = None
-
-    @property
-    def params(self) -> SamplingParams | PoolingParams:
-        """Return the processed params (sampling or pooling)."""
-        if self.sampling_params is not None:
-            return self.sampling_params
-        assert self.pooling_params is not None
-        return self.pooling_params
+    lora_request: Optional[LoRARequest]
+    tenant_id: str = "default"
+    sla_ttft_ms: float = float('inf')
 
 
 class EngineCoreEventType(enum.IntEnum):

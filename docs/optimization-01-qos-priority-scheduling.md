@@ -120,8 +120,7 @@ starvation_boost = min(waiting_seconds / 5.0, 10)
 | 文件 | 改动类型 | 改动内容 |
 |------|---------|---------|
 | `vllm/v1/request.py` | 修改 | Request 类新增 QoS 多维优先级 |
-| `vllm/v1/core/sched/scheduler.py` | 修改 | 调度器集成动态优先级更新 |
-| `vllm/v1/core/sched/request_queue.py` | 修改 | PriorityRequestQueue 新增 reheapify |
+| `vllm/v1/core/scheduler.py` | 修改 | 调度器集成动态优先级更新与排序 |
 
 ### 3.1 `vllm/v1/request.py` — Request 类增强
 
@@ -215,42 +214,43 @@ def __lt__(self, other):
     ...
 ```
 
-**影响范围**：`PriorityRequestQueue` 内部的 `heapq` 依赖 `__lt__` 做排序，修改后所有堆操作自动使用多维优先级。
+**影响范围**：`sorted()` 调用依赖 `__lt__` 做排序，修改后 waiting 队列的排序自动使用多维优先级。
 
 ---
 
-### 3.2 `vllm/v1/core/sched/scheduler.py` — 调度器集成
+### 3.2 `vllm/v1/core/scheduler.py` — 调度器集成
 
 #### 修改：`schedule()` 方法 — 每步开始时更新优先级
 
 ```python
 def schedule(self) -> SchedulerOutput:
     ...
-    self.kv_cache_manager.new_step_starts()
+    scheduled_timestamp = time.monotonic()
 
     # [新增] QoS: 每个调度步开始时更新所有请求的动态优先级
-    if self.policy == SchedulingPolicy.PRIORITY:
+    if self.enable_qos_priority:
         self._update_effective_priorities()
 
     # 后续正常调度逻辑...
 ```
 
-**时机选择**：放在 `new_step_starts()` 之后、调度 RUNNING 请求之前，确保本步所有调度决策都使用最新的优先级值。
+**时机选择**：放在 `scheduled_timestamp` 之后、调度 RUNNING 请求之前，确保本步所有调度决策都使用最新的优先级值。
 
 #### 修改：抢占逻辑 — 使用 `effective_priority`
 
 ```python
-# 改造前：使用静态 priority
-preempted_req = max(
-    self.running,
-    key=lambda r: (r.priority, r.arrival_time),
-)
+# 改造前：LIFO 简单弹出最后入队的请求
+preempted_req = self.running.pop()
 
-# 改造后：使用 effective_priority
-preempted_req = max(
-    self.running,
-    key=lambda r: (r.effective_priority, r.arrival_time),
-)
+# 改造后：QoS 模式下选择优先级最低的请求抢占
+if self.enable_qos_priority and len(self.running) > 1:
+    preempted_req = max(
+        self.running,
+        key=lambda r: (r.effective_priority, r.arrival_time),
+    )
+    self.running.remove(preempted_req)
+else:
+    preempted_req = self.running.pop()
 ```
 
 **效果**：抢占时选择 `effective_priority` 值最大（优先级最低）的请求，考虑了长度和等待时间因素。
@@ -264,36 +264,24 @@ def _update_effective_priorities(self) -> None:
     # 更新 waiting 队列中所有请求的优先级
     for request in self.waiting:
         request.compute_effective_priority(now)
-    # 重建堆序（优先级变了，堆序可能失效）
-    if isinstance(self.waiting, PriorityRequestQueue):
-        self.waiting._reheapify()
-
-    # 更新 skipped_waiting 队列
-    for request in self.skipped_waiting:
-        request.compute_effective_priority(now)
-    if isinstance(self.skipped_waiting, PriorityRequestQueue):
-        self.skipped_waiting._reheapify()
+    # 按优先级重新排序 waiting 队列（deque）
+    sorted_waiting = sorted(self.waiting)
+    self.waiting = deque(sorted_waiting)
 
     # 更新 running 请求（用于抢占决策）
     for request in self.running:
         request.compute_effective_priority(now)
 ```
 
-**为什么要 reheapify？**  
-- `PriorityRequestQueue` 内部是堆（`heapq`），堆的有序性依赖元素的 `__lt__` 比较结果
+**为什么要重新排序？**
+- v0.7.3 使用 `deque` 作为 waiting 队列，通过 `sorted()` + `__lt__` 实现优先级排序
 - 更新 `_effective_priority` 后，请求间的相对大小关系可能改变
-- 必须调用 `heapq.heapify()` 重建堆序，时间复杂度 O(n)
+- 必须重新排序以确保最高优先级请求在队首，时间复杂度 O(n log n)
 
 ---
 
-### 3.3 `vllm/v1/core/sched/request_queue.py` — 优先级队列支持
-
-#### 新增：`PriorityRequestQueue._reheapify()` 方法
-
-```python
-def _reheapify(self) -> None:
-    """Re-heapify the internal heap after external priority changes."""
-    heapq.heapify(self._heap)
+> **注**：v0.7.3 的 waiting 队列为 `deque`，没有独立的 `PriorityRequestQueue` 类。
+> 优先级排序通过每步 `sorted()` 实现，等效于 main 分支中 `PriorityRequestQueue._reheapify()` 的功能。
 ```
 
 **设计考量**：这是一个内部方法（`_` 前缀），只应由调度器在更新完所有请求优先级后调用，避免外部代码滥用。
@@ -308,8 +296,9 @@ def _reheapify(self) -> None:
 ┌────────────────────────────────────────────────────┐
 │ Step 1: 更新动态优先级                               │
 │                                                     │
-│   for req in waiting + skipped_waiting + running:   │
+│   for req in waiting + running:                     │
 │       req.compute_effective_priority(now)            │
+│   waiting = deque(sorted(waiting))  # 按优先级排序    │
 │                                                     │
 │   waiting.reheapify()  # 重建堆序                    │
 ├────────────────────────────────────────────────────┤

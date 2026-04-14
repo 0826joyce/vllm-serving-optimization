@@ -206,10 +206,16 @@ KVConnectorFactory.register_connector(
     "MooncakeConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector",
     "MooncakeConnector",
-)
+    "vllm.distributed.kv_transfer.kv_connector.simple_connector",
+    "SimpleConnector")
+
+# V1-compatible connectors for PD disaggregation in V1 architecture.
+KVConnectorFactory.register_connector(
+    "V1PyNcclConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1_connector",
+    "V1KVConnector")
 
 KVConnectorFactory.register_connector(
-    "FlexKVConnectorV1",
-    "vllm.distributed.kv_transfer.kv_connector.v1.flexkv_connector",
-    "FlexKVConnectorV1",
-)
+    "V1MooncakeConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1_connector",
+    "V1KVConnector")

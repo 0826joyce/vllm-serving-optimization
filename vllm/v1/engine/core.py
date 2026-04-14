@@ -122,27 +122,32 @@ class EngineCore:
         kv_cache_config = self._initialize_kv_caches(vllm_config)
         self.structured_output_manager = StructuredOutputManager(vllm_config)
 
+        # Setup KV Transfer for PD disaggregation if configured.
+        self.kv_transfer_config = vllm_config.kv_transfer_config
+        self.is_kv_transfer_instance = (
+            self.kv_transfer_config is not None
+            and self.kv_transfer_config.is_kv_transfer_instance)
+        self.is_kv_producer = (
+            self.kv_transfer_config is not None
+            and self.kv_transfer_config.is_kv_producer)
+        self.is_kv_consumer = (
+            self.kv_transfer_config is not None
+            and self.kv_transfer_config.is_kv_consumer)
+
+        if self.is_kv_transfer_instance:
+            logger.info(
+                "V1 PD Disaggregation enabled: role=%s, connector=%s",
+                self.kv_transfer_config.kv_role,
+                self.kv_transfer_config.kv_connector)
+
         # Setup scheduler.
-        Scheduler = vllm_config.scheduler_config.get_scheduler_cls()
-
-        if len(kv_cache_config.kv_cache_groups) == 0:  # noqa: SIM102
-            # Encoder models without KV cache don't support
-            # chunked prefill. But do SSM models?
-            if vllm_config.scheduler_config.enable_chunked_prefill:
-                logger.warning("Disabling chunked prefill for model without KVCache")
-                vllm_config.scheduler_config.enable_chunked_prefill = False
-
-        scheduler_block_size = (
-            vllm_config.cache_config.block_size
-            * vllm_config.parallel_config.decode_context_parallel_size
-            * vllm_config.parallel_config.prefill_context_parallel_size
-        )
-
-        self.scheduler: SchedulerInterface = Scheduler(
-            vllm_config=vllm_config,
-            kv_cache_config=kv_cache_config,
-            structured_output_manager=self.structured_output_manager,
-            include_finished_set=include_finished_set,
+        self.scheduler = Scheduler(
+            scheduler_config=vllm_config.scheduler_config,
+            model_config=vllm_config.model_config,
+            cache_config=vllm_config.cache_config,
+            lora_config=vllm_config.lora_config,
+            speculative_config=vllm_config.speculative_config,
+            kv_transfer_config=self.kv_transfer_config,
             log_stats=self.log_stats,
             block_size=scheduler_block_size,
         )
@@ -401,24 +406,46 @@ class EngineCore:
         # during the model execution.
         self._process_aborts_queue()
         engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output
-        )
+            scheduler_output, output)  # type: ignore
 
-        return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+        # For Prefill-only (producer) instances: after the model execution
+        # and KV send (which happens inside GPUModelRunner.execute_model),
+        # mark prefill-only requests as finished so they don't enter the
+        # decode loop.
+        if self.is_kv_producer:
+            self._finish_prefill_only_requests(scheduler_output)
 
-    def post_step(self, model_executed: bool) -> None:
-        # When using async scheduling we can't get draft token ids in advance,
-        # so we update draft token ids in the worker process and don't
-        # need to update draft token ids here.
-        if not self.async_scheduling and self.use_spec_decode and model_executed:
-            # Take the draft token ids.
-            draft_token_ids = self.model_executor.take_draft_token_ids()
-            if draft_token_ids is not None:
-                self.scheduler.update_draft_token_ids(draft_token_ids)
+        return engine_core_outputs
 
-    def step_with_batch_queue(
+    def _finish_prefill_only_requests(
         self,
-    ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
+        scheduler_output: SchedulerOutput,
+    ) -> None:
+        """For Prefill (producer) instances, mark requests as finished
+        once their prefill is complete and KV has been sent.
+
+        In a producer instance, requests only go through prefill —
+        they don't generate decode tokens. Once the prefill is done
+        (num_computed_tokens >= num_prompt_tokens), the request should
+        be finished with a special status.
+        """
+        from vllm.v1.request import RequestStatus
+
+        for req_id in list(scheduler_output.num_scheduled_tokens.keys()):
+            request = self.scheduler.requests.get(req_id)
+            if request is None:
+                continue
+            # Check if the request's prefill is now fully computed.
+            # For a producer, once prefill is complete, the KV cache
+            # has been sent (by the model runner) and we're done.
+            if request.num_computed_tokens >= request.num_tokens:
+                if request.status != RequestStatus.FINISHED_STOPPED:
+                    # Mark as finished — the decode instance will
+                    # continue generation.
+                    self.scheduler.finish_requests(
+                        [req_id], RequestStatus.FINISHED_STOPPED)
+
+    def step_with_batch_queue(self) -> Optional[EngineCoreOutputs]:
         """Schedule and execute batches with the batch queue.
         Note that if nothing to output in this step, None is returned.
 

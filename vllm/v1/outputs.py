@@ -236,73 +236,14 @@ class ModelRunnerOutput:
     # [prompt_len, num_prompt_logprobs]
     # [prompt_len, num_prompt_logprobs]
     # [prompt_len]
-    prompt_logprobs_dict: dict[str, LogprobsTensors | None] = field(
-        default_factory=dict
-    )
+    prompt_logprobs_dict: Dict[str, LogprobsTensors]
 
-    # [num_reqs, hidden_size]
-    pooler_output: list[torch.Tensor | None] | None = None
+    # ---- PD Disaggregation ----
+    # req_id -> True if KV was successfully received from Prefill instance.
+    # Only populated on Decode (consumer) instances; empty dict otherwise.
+    # Used by the scheduler's KVReceiveMonitor to track KV arrival.
+    kv_recv_success_map: Dict[str, bool] = None  # type: ignore[assignment]
 
-    kv_connector_output: KVConnectorOutput | None = None
-
-    ec_connector_output: ECConnectorOutput | None = None
-
-    # req_id -> num_nans_in_logits
-    num_nans_in_logits: dict[str, int] | None = None
-
-    # information related to cudagraph execution
-    cudagraph_stats: CUDAGraphStat | None = None
-
-
-# ModelRunnerOutput wrapper for async scheduling.
-class AsyncModelRunnerOutput(ABC):
-    @abstractmethod
-    def get_output(self) -> ModelRunnerOutput:
-        """Get the ModelRunnerOutput for this async output.
-
-        This is a blocking call that waits until the results are ready, which
-        might involve copying device tensors to the host.
-        This method should only be called once per AsyncModelRunnerOutput.
-        """
-        pass
-
-
-@dataclass
-class DraftTokenIds:
-    # [num_reqs]
-    req_ids: list[str]
-    # num_reqs x num_draft_tokens
-    draft_token_ids: list[list[int]]
-
-
-def make_empty_encoder_model_runner_output(
-    scheduler_output: "SchedulerOutput",
-) -> ModelRunnerOutput:
-    """
-    Create a ModelRunnerOutput stub that contains the correct
-    per-request bookkeeping but no generated data yet.
-    """
-    if not scheduler_output.num_scheduled_tokens:
-        return EMPTY_MODEL_RUNNER_OUTPUT
-
-    # Convert to list so we get a deterministic, indexable sequence
-    req_ids: list[str] = list(scheduler_output.num_scheduled_tokens.keys())
-
-    # Give every request its own contiguous index
-    req_id_to_index: dict[str, int] = {rid: idx for idx, rid in enumerate(req_ids)}
-
-    # No tokens generated yet ⇒ one empty list per request
-    sampled_token_ids: list[list[int]] = [[0] for _ in req_ids]
-
-    # Pooler outputs are not available yet ⇒ use None placeholders
-    pooler_output: list[torch.Tensor | None] = [None for _ in req_ids]
-
-    return ModelRunnerOutput(
-        req_ids=req_ids,
-        req_id_to_index=req_id_to_index,
-        sampled_token_ids=sampled_token_ids,
-        pooler_output=pooler_output,
-    )
-
-
-EMPTY_MODEL_RUNNER_OUTPUT = ModelRunnerOutput(req_ids=[], req_id_to_index={})
+    def __post_init__(self):
+        if self.kv_recv_success_map is None:
+            self.kv_recv_success_map = {}

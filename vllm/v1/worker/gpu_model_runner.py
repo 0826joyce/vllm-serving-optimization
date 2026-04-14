@@ -100,88 +100,23 @@ from vllm.platforms import current_platform
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
-from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
-from vllm.tracing import instrument
-from vllm.utils import length_from_prompt_token_ids_or_embeds
-from vllm.utils.math_utils import cdiv, round_up
-from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
-from vllm.utils.nvtx_pytorch_hooks import PytHooks
-from vllm.utils.platform_utils import is_pin_memory_available, num_compute_units
-from vllm.utils.torch_utils import (
-    get_dtype_size,
-    kv_cache_dtype_str_to_dtype,
-)
-from vllm.v1.attention.backend import (
-    AttentionBackend,
-    AttentionCGSupport,
-    AttentionMetadata,
-    AttentionMetadataBuilder,
-    AttentionType,
-    CommonAttentionMetadata,
-)
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
-from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
-from vllm.v1.attention.backends.utils import (
-    create_fast_prefill_custom_backend,
-    get_dcp_local_seq_lens,
-    reorder_batch_to_split_decodes_and_prefills,
-)
-from vllm.v1.core.sched.output import NewRequestData
-from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
-from vllm.v1.kv_cache_interface import (
-    AttentionSpec,
-    ChunkedLocalAttentionSpec,
-    CrossAttentionSpec,
-    EncoderOnlyAttentionSpec,
-    FullAttentionSpec,
-    KVCacheConfig,
-    KVCacheGroupSpec,
-    KVCacheSpec,
-    MambaSpec,
-    SlidingWindowSpec,
-    UniformTypeKVCacheSpecs,
-)
-from vllm.v1.outputs import (
-    EMPTY_MODEL_RUNNER_OUTPUT,
-    AsyncModelRunnerOutput,
-    DraftTokenIds,
-    ECConnectorOutput,
-    KVConnectorOutput,
-    LogprobsLists,
-    LogprobsTensors,
-    ModelRunnerOutput,
-    PoolerOutput,
-    SamplerOutput,
-    make_empty_encoder_model_runner_output,
-)
-from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
-from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
-from vllm.v1.sample.logits_processor.interface import LogitsProcessor
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.rejection_sampler import RejectionSampler
-from vllm.v1.sample.sampler import Sampler
-from vllm.v1.spec_decode.draft_model import DraftModelProposer
-from vllm.v1.spec_decode.eagle import EagleProposer
-from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
-from vllm.v1.spec_decode.medusa import MedusaProposer
-from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
-from vllm.v1.spec_decode.ngram_proposer_gpu import (
-    NgramProposerGPU,
-    copy_num_valid_draft_tokens,
-    update_ngram_gpu_tensors_incremental,
-    update_scheduler_for_invalid_drafts,
-)
-from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
-from vllm.v1.structured_output.utils import apply_grammar_bitmask
-from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
-from vllm.v1.worker import mamba_utils
-from vllm.v1.worker.cp_utils import (
-    check_attention_cp_compatibility,
-    get_total_cp_world_size,
-)
-from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
-from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
-from vllm.v1.worker.gpu.pool.late_interaction_runner import LateInteractionRunner
+from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
+                        LayerBlockType, cdiv, is_pin_memory_available)
+from vllm.v1.attention.backends.flash_attn import (FlashAttentionBackend,
+                                                   FlashAttentionMetadata)
+from vllm.v1.core.encoder_cache_manager import compute_encoder_budget
+from vllm.v1.engine.mm_input_cache import MMInputCacheClient
+from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
+                                        KVCacheSpec)
+from vllm.v1.outputs import LogprobsTensors, ModelRunnerOutput
+from vllm.v1.sample.rejection_sampler import INVALID_TOKEN_ID
+from vllm.v1.spec_decode.adaptive_suffix_proposer import (
+    AdaptiveSuffixProposer)
+from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+from vllm.v1.spec_decode.suffix_automaton_proposer import (
+    SuffixAutomatonProposer)
+from vllm.v1.spec_decode.suffix_proposer import SuffixTreeProposer
+from vllm.v1.utils import bind_kv_cache
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
@@ -205,8 +140,9 @@ from .utils import (
 )
 
 if TYPE_CHECKING:
-    from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-    from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+    from vllm.distributed.kv_transfer.kv_connector.v1_connector import (
+        V1KVConnector)
+    from vllm.v1.core.scheduler_output import SchedulerOutput
 
 logger = init_logger(__name__)
 
@@ -480,98 +416,93 @@ class GPUModelRunner(
         """
         State of the expert parallelism load balancer.
 
-        Will be lazily initialized when the model is loaded.
-        """
+        # ---- PD Disaggregation (KV Transfer) ----
+        self.kv_transfer_config = vllm_config.kv_transfer_config
+        self.is_kv_transfer_instance = (
+            self.kv_transfer_config is not None
+            and self.kv_transfer_config.is_kv_transfer_instance)
+        self.is_kv_producer = (
+            self.kv_transfer_config is not None
+            and self.kv_transfer_config.is_kv_producer)
+        self.is_kv_consumer = (
+            self.kv_transfer_config is not None
+            and self.kv_transfer_config.is_kv_consumer)
+        self.kv_connector: Optional["V1KVConnector"] = None
 
-        # Lazy initializations
-        # self.model: nn.Module  # Set after load_model
-        # Initialize in initialize_kv_cache
-        self.kv_caches: list[torch.Tensor] = []
-        # Initialize in initialize_kv_cache_tensors
-        self.cross_layers_kv_cache: torch.Tensor | None = None
-        self.cross_layers_attn_backend: type[AttentionBackend] | None = None
-        # indexes: [kv_cache_group_id][attn_group]
-        self.attn_groups: list[list[AttentionGroup]] = []
-        # self.kv_cache_config: KVCacheConfig
-
-        # mm_hash ->  encoder_output
-        self.encoder_cache: dict[str, torch.Tensor] = {}
-        self.late_interaction_runner = LateInteractionRunner()
-
-        self.use_aux_hidden_state_outputs = False
-        # Set up speculative decoding.
-        # NOTE(Jiayi): currently we put the entire draft model on
-        # the last PP rank. This is not ideal if there are many
-        # layers in the draft model.
-        if self.speculative_config and get_pp_group().is_last_rank:
-            self.drafter: (
-                NgramProposer  # noqa: F823
-                | NgramProposerGPU
-                | SuffixDecodingProposer
-                | EagleProposer
-                | DraftModelProposer
-                | MedusaProposer
-                | ExtractHiddenStatesProposer
+        if self.is_kv_transfer_instance:
+            from vllm.distributed.kv_transfer.kv_connector.v1_connector import (
+                V1KVConnector)
+            from vllm.distributed.kv_transfer.kv_connector.factory import (
+                KVConnectorFactory)
+            logger.info(
+                "V1 GPUModelRunner: Initializing KV Transfer "
+                "(role=%s, connector=%s)",
+                self.kv_transfer_config.kv_role,
+                self.kv_transfer_config.kv_connector)
+            connector = KVConnectorFactory.create_connector(
+                rank=0,  # Will be updated in init_device
+                local_rank=0,
+                config=vllm_config,
             )
-            if self.speculative_config.method == "ngram":
-                from vllm.v1.spec_decode.ngram_proposer import NgramProposer
-
-                self.drafter = NgramProposer(self.vllm_config)
-            elif self.speculative_config.uses_draft_model():
-                self.drafter = DraftModelProposer(
-                    vllm_config=self.vllm_config,
-                    device=self.device,
-                    runner=self,
-                )
-            elif self.speculative_config.use_ngram_gpu():
-                self.drafter = NgramProposerGPU(self.vllm_config, self.device, self)
-                self.num_tokens_no_spec_gpu = torch.zeros(
-                    self.max_num_reqs, dtype=torch.int32, device=device
-                )
-                self.token_ids_gpu_tensor = torch.zeros(
-                    self.max_num_reqs,
-                    self.max_model_len,
-                    dtype=torch.int32,
-                    device=device,
-                )
-                self._ngram_pinned_idx_buf = torch.zeros(
-                    self.max_num_reqs, dtype=torch.long, pin_memory=True
-                )
-                self._ngram_pinned_val_buf = torch.zeros(
-                    self.max_num_reqs, dtype=torch.int32, pin_memory=True
-                )
-            elif self.speculative_config.method == "suffix":
-                self.drafter = SuffixDecodingProposer(self.vllm_config)
-            elif self.speculative_config.use_eagle():
-                self.drafter = EagleProposer(self.vllm_config, self.device, self)
-                if self.speculative_config.method == "eagle3":
-                    self.use_aux_hidden_state_outputs = (
-                        self.drafter.eagle3_use_aux_hidden_state
-                    )
-            elif self.speculative_config.method == "medusa":
-                self.drafter = MedusaProposer(
-                    vllm_config=self.vllm_config, device=self.device
-                )
-            elif self.speculative_config.method == "extract_hidden_states":
-                self.drafter = ExtractHiddenStatesProposer(
-                    vllm_config=self.vllm_config, device=self.device
-                )
-                self.use_aux_hidden_state_outputs = True
+            if isinstance(connector, V1KVConnector):
+                self.kv_connector = connector
             else:
-                raise ValueError(
-                    "Unknown speculative decoding method: "
-                    f"{self.speculative_config.method}"
-                )
-            self.rejection_sampler = RejectionSampler(self.sampler)
+                logger.warning(
+                    "KV connector %s is not V1-compatible. "
+                    "PD disaggregation will be disabled.",
+                    type(connector).__name__)
+                self.is_kv_transfer_instance = False
+                self.is_kv_producer = False
+                self.is_kv_consumer = False
 
-        self.num_spec_tokens = 0
+        # Set up speculative decoding.
+        self.use_spec_decode = False
         if self.speculative_config:
-            self.num_spec_tokens = self.speculative_config.num_speculative_tokens
-            draft_config = self.speculative_config.draft_model_config
-            if draft_config is not None and draft_config.max_model_len is not None:
-                self.effective_drafter_max_model_len = draft_config.max_model_len
-            else:
-                self.effective_drafter_max_model_len = self.max_model_len
+            self.use_spec_decode = True
+
+            # TODO: find a better way to check if we are using ngram.
+            assert self.speculative_config.ngram_prompt_lookup_min, \
+                    "Currently, only ngram spec decode is supported in V1."
+            if get_pp_group().is_last_rank:
+                import os
+                proposer_type = os.environ.get(
+                    "VLLM_SPEC_PROPOSER", "ngram").lower()
+                if proposer_type == "adaptive":
+                    logger.info(
+                        "Using AdaptiveSuffixProposer for speculative "
+                        "decoding (multi-candidate scoring).")
+                    self.drafter = AdaptiveSuffixProposer()
+                elif proposer_type == "suffix_automaton":
+                    logger.info(
+                        "Using SuffixAutomatonProposer for speculative "
+                        "decoding (incremental SAM).")
+                    self.drafter = SuffixAutomatonProposer()
+                elif proposer_type == "suffix":
+                    logger.info(
+                        "Using SuffixTreeProposer for speculative decoding.")
+                    self.drafter = SuffixTreeProposer()
+                else:
+                    logger.info(
+                        "Using NgramProposer for speculative decoding.")
+                    self.drafter = NgramProposer()
+                # Trigger JIT compilation / warmup for the proposer.
+                # This usually takes less than 1 second.
+                # AdaptiveSuffixProposer inherits from SuffixAutomatonProposer
+                # so isinstance check covers both.
+                if isinstance(self.drafter, SuffixAutomatonProposer):
+                    self.drafter.propose(
+                        np.zeros(1024, dtype=np.int32),
+                        self.speculative_config.ngram_prompt_lookup_min,
+                        self.speculative_config.num_speculative_tokens,
+                        req_id="__warmup__",
+                    )
+                    self.drafter.remove_request("__warmup__")
+                else:
+                    self.drafter.propose(
+                        np.zeros(1024, dtype=np.int32),
+                        self.speculative_config.ngram_prompt_lookup_min,
+                        self.speculative_config.num_speculative_tokens,
+                    )
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
@@ -1042,10 +973,11 @@ class GPUModelRunner(
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
-            self.num_prompt_logprobs.pop(req_id, None)
-        self.late_interaction_runner.on_requests_finished(
-            scheduler_output.finished_req_ids
-        )
+            self.encoder_cache.pop(req_id, None)
+            # Clean up per-request SAM state if using SuffixAutomatonProposer.
+            if (self.use_spec_decode
+                    and isinstance(self.drafter, SuffixAutomatonProposer)):
+                self.drafter.remove_request(req_id)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -2855,137 +2787,19 @@ class GPUModelRunner(
     ) -> IntermediateTensors:
         assert self.intermediate_tensors is not None
 
-        tp = self.vllm_config.parallel_config.tensor_parallel_size
-        is_rs = is_residual_scattered_for_sp(self.vllm_config, num_tokens)
+        # ---- PD Disaggregation: KV Consumer (Decode instance) ----
+        # Before running the model, attempt to receive KV caches for
+        # prefill requests from the Prefill instance.
+        bypass_model_exec = False
+        kv_recv_success_map: Dict[str, bool] = {}
+        if self.is_kv_consumer and self.kv_connector is not None:
+            bypass_model_exec, kv_recv_success_map = (
+                self._recv_kv_caches_for_consumer(scheduler_output))
 
-        # When sequence parallelism is enabled, the "residual" tensor is sharded
-        # across tensor parallel ranks, so each rank only needs its own slice.
-        if sync_self:
-            assert intermediate_tensors is not None
-            for k, v in intermediate_tensors.items():
-                is_scattered = k == "residual" and is_rs
-                copy_len = num_tokens // tp if is_scattered else num_tokens
-                self.intermediate_tensors[k][:copy_len].copy_(
-                    v[:copy_len], non_blocking=True
-                )
-
-        return IntermediateTensors(
-            {
-                k: v[: num_tokens // tp]
-                if k == "residual" and is_rs
-                else v[:num_tokens]
-                for k, v in self.intermediate_tensors.items()
-            }
-        )
-
-    def eplb_step(self, is_dummy: bool = False, is_profile: bool = False) -> None:
-        """
-        Step for the EPLB (Expert Parallelism Load Balancing) state.
-        """
-        if not self.parallel_config.enable_eplb or self.eep_eplb_suppressed:
-            return
-
-        assert self.eplb_state is not None
-        model = self.get_model()
-        assert is_mixture_of_experts(model)
-        self.eplb_state.step(
-            is_dummy,
-            is_profile,
-            log_stats=self.parallel_config.eplb_config.log_balancedness,
-        )
-
-    def setup_eplb_from_mapping(
-        self,
-        expanded_physical_to_logical: torch.Tensor,
-        old_num_physical_experts: int,
-    ) -> None:
-        model = self.get_model()
-        assert is_mixture_of_experts(model)
-
-        self.eplb_state = EplbState.from_mapping(
-            model=model,
-            model_config=self.model_config,
-            device=self.device,
-            parallel_config=self.parallel_config,
-            expanded_physical_to_logical=expanded_physical_to_logical,
-            num_valid_physical_experts=old_num_physical_experts,
-        )
-
-    def _pool(
-        self,
-        hidden_states: torch.Tensor,
-        num_scheduled_tokens: int,
-        num_scheduled_tokens_np: np.ndarray,
-        kv_connector_output: KVConnectorOutput | None,
-    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        num_reqs = self.input_batch.num_reqs
-        assert num_reqs == len(self.input_batch.pooling_params), (
-            "Either all or none of the requests in a batch must be pooling request"
-        )
-
-        hidden_states = hidden_states[:num_scheduled_tokens]
-        seq_lens_cpu = self.seq_lens.cpu[:num_reqs]
-
-        pooling_metadata = self.input_batch.get_pooling_metadata()
-        pooling_metadata.build_pooling_cursor(
-            num_scheduled_tokens_np, seq_lens_cpu, device=hidden_states.device
-        )
-
-        model = cast(VllmModelForPooling, self.model)
-        raw_pooler_output: PoolerOutput = model.pooler(
-            hidden_states=hidden_states, pooling_metadata=pooling_metadata
-        )
-
-        finished_mask = [
-            seq_len == prompt_len
-            for seq_len, prompt_len in zip(seq_lens_cpu, pooling_metadata.prompt_lens)
-        ]
-        raw_pooler_output = self.late_interaction_runner.postprocess_pooler_output(
-            raw_pooler_output=raw_pooler_output,
-            pooling_params=pooling_metadata.pooling_params,
-            req_ids=self.input_batch.req_ids,
-            finished_mask=finished_mask,
-        )
-
-        model_runner_output = ModelRunnerOutput(
-            req_ids=self.input_batch.req_ids.copy(),
-            req_id_to_index=self.input_batch.req_id_to_index.copy(),
-            kv_connector_output=kv_connector_output,
-        )
-
-        if raw_pooler_output is None or not any(finished_mask):
-            model_runner_output.pooler_output = [None] * num_reqs
-            return model_runner_output
-
-        if self.use_async_scheduling:
-            return AsyncGPUPoolingModelRunnerOutput(
-                model_runner_output=model_runner_output,
-                raw_pooler_output=raw_pooler_output,
-                finished_mask=finished_mask,
-                async_output_copy_stream=self.async_output_copy_stream,
-            )
-
-        model_runner_output.pooler_output = _copy_pooler_output_to_cpu(
-            raw_pooler_output=raw_pooler_output,
-            finished_mask=finished_mask,
-        )
-        self._sync_device()
-
-        return model_runner_output
-
-    def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:
-        # Pad tokens to multiple of tensor_parallel_size when
-        # enabled collective fusion for SP
-        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-        if self.compilation_config.pass_config.enable_sp and tp_size > 1:
-            return round_up(num_scheduled_tokens, tp_size)
-        return num_scheduled_tokens
-
-    def _prepare_mm_inputs(
-        self, num_tokens: int
-    ) -> tuple[torch.Tensor | None, torch.Tensor]:
-        if self.model.requires_raw_input_tokens:
-            input_ids = self.input_ids.gpu[:num_tokens]
+        if self.is_multimodal_model:
+            # Run the multimodal encoder if any.
+            self._execute_encoder(scheduler_output)
+            encoder_outputs = self._gather_encoder_outputs(scheduler_output)
         else:
             input_ids = None
 
@@ -3086,27 +2900,50 @@ class GPUModelRunner(
             intermediate_tensors = None
         else:
             assert intermediate_tensors is not None
-            intermediate_tensors = self.sync_and_slice_intermediate_tensors(
-                num_input_tokens, intermediate_tensors, True
-            )
+            assert self.intermediate_tensors is not None
+            for k, v in intermediate_tensors.items():
+                self.intermediate_tensors[k][:num_input_tokens].copy_(
+                    v[:num_input_tokens], non_blocking=True)
+            intermediate_tensors = IntermediateTensors({
+                k: v[:num_input_tokens]
+                for k, v in self.intermediate_tensors.items()
+            })
 
-        if is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
-            # Run the encoder, just like we do with other multimodal inputs.
-            # For an encoder-decoder model, our processing here is a bit
-            # simpler, because the outputs are just passed to the decoder.
-            # We are not doing any prompt replacement. We also will only
-            # ever have a single encoder input.
-            encoder_outputs = self._execute_mm_encoder(scheduler_output)
-            model_kwargs.update({"encoder_outputs": encoder_outputs})
+        # ---- PD Disaggregation: Skip forward if all KV received ----
+        if not bypass_model_exec:
+            # Run the decoder.
+            # Use persistent buffers for CUDA graphs.
+            with set_forward_context(attn_metadata, self.vllm_config):
+                hidden_states = self.model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    kv_caches=self.kv_caches,
+                    attn_metadata=None,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                )
+        else:
+            # All requests had their KV caches received from the Prefill
+            # instance. We bypass the forward pass entirely.
+            # Create dummy hidden states for sampling.
+            logger.debug("V1 PD: Bypassing model forward — all KV received.")
+            hidden_states = torch.zeros(
+                num_input_tokens, self.hidden_size,
+                dtype=self.dtype, device=self.device)
 
-        return (
-            input_ids,
-            inputs_embeds,
-            positions,
-            intermediate_tensors,
-            model_kwargs,
-            ec_connector_output,
-        )
+        if not get_pp_group().is_last_rank:
+            # For mid-pipeline stages, return the hidden states.
+            return hidden_states
+
+        hidden_states = hidden_states[:num_scheduled_tokens]
+
+        # ---- PD Disaggregation: KV Producer (Prefill instance) ----
+        # After the forward pass, send KV caches to the Decode instance.
+        if self.is_kv_producer and self.kv_connector is not None:
+            self._send_kv_caches_for_producer(scheduler_output, hidden_states)
+
+        sample_hidden_states = hidden_states[logits_indices]
+        logits = self.model.compute_logits(sample_hidden_states, None)
 
     def _sample(
         self,
@@ -3271,67 +3108,263 @@ class GPUModelRunner(
             yield
             return
 
-        # Ensure prior step has finished with reused CPU tensors.
-        # This is required in the async scheduling case because
-        # the CPU->GPU transfer happens async.
-        self.prepare_inputs_event.synchronize()
-        try:
-            yield
-        finally:
-            self.prepare_inputs_event.record()
+        model_runner_output = ModelRunnerOutput(
+            req_ids=self.input_batch.req_ids,
+            req_id_to_index=self.input_batch.req_id_to_index,
+            sampled_token_ids=valid_sampled_token_ids,
+            spec_token_ids=spec_token_ids,
+            logprobs=logprobs_lists,
+            prompt_logprobs_dict=prompt_logprobs_dict,
+            kv_recv_success_map=kv_recv_success_map,
+        )
+        return model_runner_output
 
     def _model_forward(
         self,
-        input_ids: torch.Tensor | None = None,
-        positions: torch.Tensor | None = None,
-        intermediate_tensors: IntermediateTensors | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-        **model_kwargs: dict[str, Any],
-    ) -> Any:
-        """Helper method to call the model forward pass.
+        sampled_token_ids: List[List[int]],
+    ) -> List[List[int]]:
+        # TODO(woosuk): Optimize.
+        draft_token_ids: List[List[int]] = []
+        use_sam = isinstance(self.drafter, SuffixAutomatonProposer)
+        use_adaptive = isinstance(self.drafter, AdaptiveSuffixProposer)
+        for i, sampled_ids in enumerate(sampled_token_ids):
+            num_sampled_ids = len(sampled_ids)
+            if not num_sampled_ids:
+                # Skip speculative decoding.
+                draft_token_ids.append([])
+                continue
 
-        This method can be overridden by subclasses for model execution.
-        Motivation: We can inspect only this method versus
-        the whole execute_model, which has additional logic.
+            # Feed acceptance feedback to AdaptiveSuffixProposer.
+            # num_sampled_ids = num_accepted_draft + 1 (bonus token)
+            # So num_accepted = num_sampled_ids - 1
+            if (use_adaptive and num_sampled_ids > 1
+                    and isinstance(self.drafter, AdaptiveSuffixProposer)):
+                req_id = self.input_batch.req_ids[i]
+                self.drafter.update_acceptance(
+                    req_id, num_accepted=num_sampled_ids - 1)
+
+            # Add sampled_token_ids to token_ids_cpu.
+            start_idx = self.input_batch.num_tokens_no_spec[i]
+            end_idx = start_idx + num_sampled_ids
+            self.input_batch.token_ids_cpu[i, start_idx:end_idx] = sampled_ids
+            if use_sam:
+                # SuffixAutomatonProposer (and its subclass
+                # AdaptiveSuffixProposer) needs req_id for stateful tracking.
+                req_id = self.input_batch.req_ids[i]
+                drafter_output = self.drafter.propose(
+                    self.input_batch.token_ids_cpu[i, :end_idx],
+                    self.speculative_config.ngram_prompt_lookup_min,
+                    self.speculative_config.num_speculative_tokens,
+                    req_id=req_id,
+                )
+            else:
+                drafter_output = self.drafter.propose(
+                    self.input_batch.token_ids_cpu[i, :end_idx],
+                    self.speculative_config.ngram_prompt_lookup_min,
+                    self.speculative_config.num_speculative_tokens,
+                )
+            if drafter_output is None or len(drafter_output) == 0:
+                draft_token_ids.append([])
+            else:
+                draft_token_ids.append(drafter_output.tolist())
+        return draft_token_ids
+
+    # ------------------------------------------------------------------
+    # PD Disaggregation: KV Cache Send/Recv Helpers
+    # ------------------------------------------------------------------
+
+    def _has_prefill_requests(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> bool:
+        """Check if the current batch contains any prefill requests.
+
+        In V1, a request is in "prefill" if its num_computed_tokens
+        has not yet reached num_tokens (prompt_token_ids length).
+        """
+        for req_id in scheduler_output.num_scheduled_tokens:
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                # New request — definitely prefill
+                return True
+            if req_state.num_computed_tokens < req_state.num_tokens:
+                return True
+        return False
+
+    def _recv_kv_caches_for_consumer(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> Tuple[bool, Dict[str, bool]]:
+        """Attempt to receive KV caches for prefill requests from
+        the Prefill (producer) instance.
+
+        For each new prefill request, try to receive its KV cache
+        from the consumer buffer. If successful, mark the request's
+        KV cache as fully computed so the forward pass can be skipped.
 
         Args:
-            input_ids: Input token IDs
-            positions: Token positions
-            intermediate_tensors: Tensors from previous pipeline stages
-            inputs_embeds: Input embeddings (alternative to input_ids)
-            **model_kwargs: Additional model arguments
+            scheduler_output: The current scheduler output.
 
         Returns:
-            Model output tensor
+            A tuple of:
+              - bypass_model_exec: True if ALL requests' KV were received.
+              - kv_recv_success_map: req_id -> whether KV was received.
         """
-        return self.model(
-            input_ids=input_ids,
-            positions=positions,
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds,
-            **model_kwargs,
-        )
+        assert self.kv_connector is not None
 
-    @staticmethod
-    def _is_uniform_decode(
-        max_num_scheduled_tokens: int,
-        uniform_decode_query_len: int,
-        num_tokens: int,
-        num_reqs: int,
-        force_uniform_decode: bool | None = None,
-    ) -> bool:
-        """
-        Checks if it's a decode batch with same amount scheduled tokens
-        across all requests.
-        """
-        return (
-            (
-                (max_num_scheduled_tokens == uniform_decode_query_len)
-                and (num_tokens == max_num_scheduled_tokens * num_reqs)
+        kv_recv_success_map: Dict[str, bool] = {}
+        all_received = True
+
+        # Only attempt to receive KV for prefill requests (new requests).
+        for new_req_data in scheduler_output.scheduled_new_reqs:
+            req_id = new_req_data.req_id
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                # Not yet in cache — this is a brand new request.
+                # We need to wait until _update_states has been called.
+                # Since _update_states is called before us in execute_model,
+                # try again.
+                req_state = self.requests.get(req_id)
+                if req_state is None:
+                    kv_recv_success_map[req_id] = False
+                    all_received = False
+                    continue
+
+            # Build the input tokens tensor for the request.
+            num_tokens = req_state.num_tokens
+            input_tokens = torch.tensor(
+                req_state.prompt_token_ids[:num_tokens],
+                dtype=torch.int32, device=self.device)
+
+            success, num_recv_tokens, hidden = self.kv_connector.recv_kv_caches_v1(
+                req_id=req_id,
+                input_tokens=input_tokens,
+                kv_caches=self.kv_caches,
+                block_ids=req_state.block_ids,
+                block_size=self.block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                num_layers=self.num_attn_layers,
             )
-            if force_uniform_decode is None
-            else force_uniform_decode
-        )
+
+            kv_recv_success_map[req_id] = success
+            if success and num_recv_tokens == num_tokens:
+                # All KV received — update num_computed_tokens to skip prefill.
+                req_state.num_computed_tokens = num_recv_tokens
+                self.input_batch.num_computed_tokens_cpu[
+                    self.input_batch.req_id_to_index[req_id]] = num_recv_tokens
+                logger.debug(
+                    "V1 PD Consumer: req_id=%s, received %d tokens — "
+                    "skipping prefill", req_id, num_recv_tokens)
+            else:
+                all_received = False
+                if success:
+                    logger.debug(
+                        "V1 PD Consumer: req_id=%s, partial recv %d/%d — "
+                        "fallback to prefill", req_id, num_recv_tokens,
+                        num_tokens)
+                else:
+                    logger.debug(
+                        "V1 PD Consumer: req_id=%s, no KV found — "
+                        "fallback to prefill", req_id)
+
+        # Also check cached (running) requests that are still prefilling
+        for cached_req_data in scheduler_output.scheduled_cached_reqs:
+            req_id = cached_req_data.req_id
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                continue
+            if req_state.num_computed_tokens < req_state.num_tokens:
+                # This is a prefill request still in progress.
+                # For basic 1P1D, we don't attempt recv for ongoing prefills.
+                all_received = False
+
+        return all_received, kv_recv_success_map
+
+    def _send_kv_caches_for_producer(
+        self,
+        scheduler_output: "SchedulerOutput",
+        hidden_states: torch.Tensor,
+    ) -> None:
+        """Send KV caches for completed prefill requests to the
+        Decode (consumer) instance.
+
+        For each request that has just finished its prefill (or a chunk
+        of prefill), send the KV cache data through the producer buffer.
+
+        Args:
+            scheduler_output: The current scheduler output.
+            hidden_states: The hidden states from the forward pass.
+        """
+        assert self.kv_connector is not None
+
+        # Track position offsets for extracting hidden states per request.
+        offset = 0
+
+        for i, req_id in enumerate(self.input_batch.req_ids):
+            if req_id not in scheduler_output.num_scheduled_tokens:
+                continue
+
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                continue
+
+            num_scheduled = scheduler_output.num_scheduled_tokens[req_id]
+            seq_len = req_state.num_computed_tokens + num_scheduled
+
+            # Only send KV for requests that have prefill tokens scheduled.
+            # In V1, a request is prefilling if num_computed_tokens < num_tokens.
+            is_prefill = (req_state.num_computed_tokens < req_state.num_tokens)
+            if not is_prefill:
+                offset += num_scheduled
+                continue
+
+            # Build input tokens for the request.
+            all_token_ids = list(req_state.prompt_token_ids)
+            all_token_ids.extend(req_state.output_token_ids)
+            num_tokens = min(seq_len, len(all_token_ids))
+            input_tokens = torch.tensor(
+                all_token_ids[:num_tokens],
+                dtype=torch.int32, device=self.device)
+
+            # Extract hidden states for this request.
+            req_hidden = hidden_states[offset:offset + num_scheduled]
+
+            self.kv_connector.send_kv_caches_v1(
+                req_id=req_id,
+                input_tokens=input_tokens,
+                kv_caches=self.kv_caches,
+                block_ids=req_state.block_ids,
+                num_computed_tokens=req_state.num_computed_tokens,
+                num_new_tokens=num_scheduled,
+                block_size=self.block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                num_layers=self.num_attn_layers,
+                hidden_states=req_hidden,
+            )
+            logger.debug(
+                "V1 PD Producer: req_id=%s, sent %d tokens "
+                "(computed=%d, scheduled=%d)",
+                req_id, num_tokens, req_state.num_computed_tokens,
+                num_scheduled)
+
+            offset += num_scheduled
+
+    def load_model(self) -> None:
+        logger.info("Starting to load model %s...", self.model_config.model)
+        with DeviceMemoryProfiler() as m:  # noqa: SIM117
+            self.model = get_model(vllm_config=self.vllm_config)
+            if self.lora_config:
+                self.model = self.load_lora_model(self.model,
+                                                  self.model_config,
+                                                  self.scheduler_config,
+                                                  self.lora_config,
+                                                  self.device)
+
+        self.model_memory_usage = m.consumed_memory
+        logger.info("Loading model weights took %.4f GB",
+                    self.model_memory_usage / float(2**30))
 
     def _determine_batch_execution_and_padding(
         self,

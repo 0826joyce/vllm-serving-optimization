@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import itertools
-from collections.abc import Sequence
-from dataclasses import dataclass
-from typing import Literal, overload
+from collections import defaultdict
+from typing import DefaultDict, Dict, Iterable, List, Optional, Tuple, Deque
+from collections import deque
 
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
@@ -152,6 +151,13 @@ class KVCacheManager:
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
 
+        # ---- Cache version management: hit-rate monitoring ----
+        self._hit_rate_window: Deque[float] = deque(maxlen=100)
+        self._cache_health_check_interval = 10
+        self._cache_health_counter = 0
+        self._default_protected_ratio = 0.5
+        self._protected_ratio_shrunk = False  # Track whether we've shrunk
+
     @property
     def usage(self) -> float:
         """Get the KV cache usage.
@@ -185,35 +191,48 @@ class KVCacheManager:
                 - A list of blocks that are computed for the request.
                 - The number of computed tokens.
         """
-        # We skip finding the prefix cache hit when prefix caching is
-        # disabled or the request is marked as skipping kv cache read
-        # (which happens when the request requires prompt logprobs
-        # or calls a pooling model with all pooling).
-        if not self.enable_caching or request.skip_reading_prefix_cache:
-            return self.empty_kv_cache_blocks, 0
+        if not self.enable_caching:
+            # Prefix caching is disabled.
+            return [], 0
 
-        # NOTE: When all tokens hit the cache, we must recompute the last token
-        # to obtain logits. Thus, set max_cache_hit_length to prompt_length - 1.
-        # This can trigger recomputation of an entire block, rather than just
-        # the single last token, because allocate_slots() requires
-        # num_computed_tokens to be block-size aligned. Removing this limitation
-        # could slightly improve performance in the future.
-        max_cache_hit_length = request.num_tokens - 1
-        computed_blocks, num_new_computed_tokens = (
-            self.coordinator.find_longest_cache_hit(
-                request.block_hashes, max_cache_hit_length
-            )
-        )
+        computed_blocks = []
 
-        if self.log_stats:
-            assert self.prefix_cache_stats is not None
-            self.prefix_cache_stats.record(
-                num_tokens=request.num_tokens,
-                num_hits=num_new_computed_tokens,
-                preempted=request.num_preemptions > 0,
-            )
+        # The block hashes for the request may already be computed
+        # if the scheduler has tried to schedule the request before.
+        block_hashes = self.req_to_block_hashes[request.request_id]
+        if not block_hashes:
+            block_hashes = hash_request_tokens(self.block_size, request)
+            self.req_to_block_hashes[request.request_id] = block_hashes
 
-        return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
+        for block_hash in block_hashes:
+            # block_hashes is a chain of block hashes. If a block hash is not
+            # in the cached_block_hash_to_id, the following block hashes are
+            # not computed yet for sure.
+            if cached_block := self._get_cached_block(block_hash):
+                computed_blocks.append(cached_block)
+            else:
+                break
+
+        self.prefix_cache_stats.requests += 1
+        self.prefix_cache_stats.queries += len(block_hashes)
+        self.prefix_cache_stats.hits += len(computed_blocks)
+
+        # ---- Cache version management: record hit rate ----
+        num_hashes = len(block_hashes)
+        if num_hashes > 0:
+            hit_rate = len(computed_blocks) / num_hashes
+            self._hit_rate_window.append(hit_rate)
+
+            self._cache_health_counter += 1
+            if self._cache_health_counter >= self._cache_health_check_interval:
+                self._check_cache_health()
+                self._cache_health_counter = 0
+
+        # NOTE(woosuk): Since incomplete blocks are not eligible for
+        # sharing, `num_computed_tokens` is always a multiple of
+        # `block_size`.
+        num_computed_tokens = len(computed_blocks) * self.block_size
+        return computed_blocks, num_computed_tokens
 
     def allocate_slots(
         self,
@@ -392,6 +411,10 @@ class KVCacheManager:
         We free the blocks in reverse order so that the tail blocks are evicted
         first when caching is enabled.
 
+        Segmented LRU integration: blocks that were previously cache-hit
+        (``_promoted == True``) are placed into the protected zone instead
+        of probation, giving them higher eviction resistance.
+
         Args:
             request: The request to free the blocks.
         """
@@ -403,12 +426,16 @@ class KVCacheManager:
         """Remove the blocks that are no longer needed from `blocks` and replace
         the removed blocks with null_block.
 
-        Args:
-            request_id: The request ID.
-            total_computed_tokens: The total number of computed tokens, including
-                local computed tokens and external computed tokens.
-        """
-        self.coordinator.remove_skipped_blocks(request_id, total_computed_tokens)
+        for block in ordered_blocks:
+            block.decr_ref()
+            if block.ref_cnt == 0:
+                if block._promoted:
+                    # This block was cache-hit before; place it in the
+                    # protected zone for higher eviction resistance.
+                    self.free_block_queue.append_protected(block)
+                    block._promoted = False
+                else:
+                    self.free_block_queue.append(block)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
@@ -417,6 +444,65 @@ class KVCacheManager:
             block_ids: Set of block IDs to evict from cache.
         """
         self.block_pool.evict_blocks(block_ids)
+
+    def free_partial(self, request: Request,
+                     keep_prefix_blocks: int) -> int:
+        """Partially free blocks for a preempted request.
+
+        Only tail blocks (beyond *keep_prefix_blocks*) are released.
+        The retained prefix blocks keep ``ref_cnt > 0`` so they remain
+        protected from eviction, benefiting both this request's future
+        resume and other requests sharing the same prefix.
+
+        ``req_to_blocks`` is updated to contain only the kept blocks;
+        ``req_to_block_hashes`` is NOT trimmed because it caches the
+        hash chain and will be reused on the next ``get_computed_blocks``
+        call when the request resumes.
+
+        Args:
+            request: The preempted request.
+            keep_prefix_blocks: Number of head blocks to retain
+                (ref_cnt stays unchanged).
+
+        Returns:
+            The number of blocks actually freed.
+        """
+        blocks = self.req_to_blocks.get(request.request_id)
+        if not blocks:
+            return 0
+
+        keep_prefix_blocks = max(0, min(keep_prefix_blocks, len(blocks)))
+        freed_blocks = blocks[keep_prefix_blocks:]
+        kept_blocks = blocks[:keep_prefix_blocks]
+
+        # Release tail blocks in reverse order (same convention as free()).
+        ordered: Iterable[KVCacheBlock] = freed_blocks
+        if self.enable_caching:
+            ordered = reversed(freed_blocks)
+
+        for block in ordered:
+            block.decr_ref()
+            if block.ref_cnt == 0:
+                if block._promoted:
+                    self.free_block_queue.append_protected(block)
+                    block._promoted = False
+                else:
+                    self.free_block_queue.append(block)
+
+        if kept_blocks:
+            self.req_to_blocks[request.request_id] = kept_blocks
+        else:
+            self.req_to_blocks.pop(request.request_id, None)
+
+        # Update num_cached_block to not exceed the kept blocks count.
+        prev_cached = self.num_cached_block.get(request.request_id, 0)
+        if keep_prefix_blocks > 0:
+            self.num_cached_block[request.request_id] = min(
+                prev_cached, keep_prefix_blocks)
+        else:
+            self.num_cached_block.pop(request.request_id, None)
+
+        return len(freed_blocks)
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
@@ -480,9 +566,31 @@ class KVCacheManager:
         """Get the blocks of a request."""
         return self.create_kv_cache_blocks(self.coordinator.get_blocks(request_id))
 
-    def get_block_ids(self, request_id: str) -> tuple[list[int], ...]:
-        """Get the block ids of a request."""
-        return self.get_blocks(request_id).get_block_ids()
+        When Segmented LRU is enabled, a cache hit on a free block marks it
+        as ``_promoted``.  When the block is later freed again (ref_cnt → 0),
+        it will enter the protected zone instead of probation, giving it
+        higher eviction resistance.
+
+        Args:
+            blocks: A list of blocks to touch.
+        """
+        for block in blocks:
+            # ref_cnt=0 means this block is in the free list (i.e. eviction
+            # candidate), so remove it.
+            if block.ref_cnt == 0:
+                # Mark for protected-zone placement on next free().
+                block._promoted = True
+                self.free_block_queue.remove(block)
+            block.incr_ref()
+
+    def _cache_full_blocks(
+        self,
+        request: Request,
+        blk_start_idx: int,
+        full_blocks: List[KVCacheBlock],
+        prev_block: Optional[KVCacheBlock],
+    ) -> None:
+        """Cache a list of full blocks for prefix caching.
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """Cache the blocks for the request, if enabled.
@@ -492,22 +600,177 @@ class KVCacheManager:
             num_computed_tokens: The number of computed tokens, including tokens
                 that are already cached and tokens to be cached.
         """
-        if self.enable_caching:
-            self.coordinator.cache_blocks(request, num_computed_tokens)
+        block_hashes = self.req_to_block_hashes[request.request_id]
+        num_cached_block_hashes = len(block_hashes)
 
-    def create_kv_cache_blocks(
-        self, blocks: tuple[list[KVCacheBlock], ...]
-    ) -> KVCacheBlocks:
-        # Only create new KVCacheBlocks for non-empty blocks
-        return KVCacheBlocks(blocks) if any(blocks) else self.empty_kv_cache_blocks
+        # Update the new blocks with the block hashes through the chain.
+        prev_block_hash_value = None
+        if prev_block is not None:
+            # Previous block must have a block hash because it must be
+            # a full, cached block.
+            assert prev_block.block_hash is not None
+            prev_block_hash_value = prev_block.block_hash.hash_value
 
-    def take_new_block_ids(self) -> list[int]:
-        """Drain and return new attention block IDs for zeroing."""
-        ids: list[int] = []
-        for mgr in self.coordinator.single_type_managers:
-            ids.extend(mgr.take_new_block_ids())
-        return ids
+        # Find the first uncached block. This case should only happen when
+        # speculative decoding is used.
+        offset = 0
+        for blk in full_blocks:
+            if blk.block_hash is None:
+                break
+            else:
+                prev_block_hash_value = blk.block_hash.hash_value
+                offset += 1
+        else:
+            # All blocks are cached.
+            return
 
-    def new_step_starts(self) -> None:
-        """Called when a new step is started."""
-        self.coordinator.new_step_starts()
+        for i, blk in enumerate(full_blocks[offset:]):
+            blk_idx = blk_start_idx + offset + i
+            assert blk.block_hash is None
+
+            if blk_idx < num_cached_block_hashes:
+                # The block hash may already be computed in
+                # "get_computed_blocks" if the tokens are not generated by
+                # this request (either the prompt tokens or the previously
+                # generated tokens with preemption). In this case we simply
+                # reuse the block hash.
+                block_hash = block_hashes[blk_idx]
+            else:
+                # Otherwise compute the block hash and cache it in the request
+                # in case it will be preempted in the future.
+                start_token_idx = blk_idx * self.block_size
+                end_token_idx = (blk_idx + 1) * self.block_size
+                block_tokens = request.all_token_ids[
+                    start_token_idx:end_token_idx]
+                assert len(block_tokens) == self.block_size, (
+                    f"Expected {self.block_size} tokens, got "
+                    f"{len(block_tokens)} at {blk_idx}th block for request "
+                    f"{request.request_id}({request})")
+
+                # Generate extra keys for multi-modal inputs. Note that since
+                # we reach to this branch only when the block is completed with
+                # generated tokens, we only need to consider the last mm input.
+                extra_keys, _ = generate_block_hash_extra_keys(
+                    request, start_token_idx, end_token_idx, -1)
+
+                # Compute the hash of the current block.
+                block_hash = hash_block_tokens(prev_block_hash_value,
+                                               block_tokens, extra_keys)
+                block_hashes.append(block_hash)
+
+            # Update and added the full block to the cache.
+            blk.block_hash = block_hash
+            self.cached_block_hash_to_block[block_hash][blk.block_id] = blk
+            prev_block_hash_value = block_hash.hash_value
+
+    # ------------------------------------------------------------------
+    # Cache version management: adaptive protected zone resizing
+    # ------------------------------------------------------------------
+
+    def _check_cache_health(self) -> None:
+        """Detect cache health and adaptively resize the protected zone.
+
+        When the hit rate drops sharply (e.g. due to a prompt version
+        switch), we temporarily shrink the protected zone so that stale
+        blocks are demoted to probation and evicted faster, making room
+        for the new prompt's blocks.  Once the hit rate recovers, we
+        restore the original protected ratio.
+
+        Thresholds:
+            - Drop detection: recent 10 avg < 0.3 AND older 10 avg > 0.5
+            - Recovery detection: recent 10 avg > 0.5
+        """
+        window_len = len(self._hit_rate_window)
+        if window_len < 20:
+            return
+
+        # Compute recent vs older average hit rates.
+        # Convert deque to list for slicing (deque doesn't support slicing).
+        window_list = list(self._hit_rate_window)
+        recent = sum(window_list[-10:]) / 10
+        older = sum(window_list[-20:-10]) / 10
+
+        if recent < 0.3 and older > 0.5 and not self._protected_ratio_shrunk:
+            # Hit rate dropped sharply → shrink protected zone.
+            logger.info(
+                "Cache health: hit rate dropped %.2f → %.2f, "
+                "shrinking protected zone to 10%%", older, recent)
+            self.free_block_queue.resize_protected(0.1)
+            self._protected_ratio_shrunk = True
+        elif recent > 0.5 and self._protected_ratio_shrunk:
+            # Hit rate recovered → restore protected zone.
+            logger.info(
+                "Cache health: hit rate recovered to %.2f, "
+                "restoring protected zone to %.0f%%",
+                recent, self._default_protected_ratio * 100)
+            self.free_block_queue.resize_protected(
+                self._default_protected_ratio)
+            self._protected_ratio_shrunk = False
+
+    def free_block_hashes(self, request: Request) -> None:
+        """Discard the block hashes for the request.
+
+        NOTE: Unlike `free`, this method should be called only when the request
+        is finished, not when it is preempted.
+        """
+        self.req_to_block_hashes.pop(request.request_id, None)
+
+    # ------------------------------------------------------------------
+    # PD Disaggregation: Register received KV blocks
+    # ------------------------------------------------------------------
+
+    def register_received_blocks(
+        self,
+        request: Request,
+        num_received_tokens: int,
+    ) -> None:
+        """Register KV blocks received from a Prefill instance into the
+        prefix cache.
+
+        When acting as a KV consumer (Decode instance), this method is
+        called after KV data has been written into the paged KV cache.
+        It registers the block hashes so that:
+        1. The Decode instance's prefix cache is updated.
+        2. Future requests with the same prefix can hit the cache.
+
+        This method computes the block hashes using the same hash_chain
+        algorithm as the local prefix cache, ensuring consistency.
+
+        Args:
+            request: The request whose KV blocks were received.
+            num_received_tokens: Number of tokens received.
+        """
+        if not self.enable_caching:
+            return
+
+        req_id = request.request_id
+        req_blocks = self.req_to_blocks.get(req_id)
+        if not req_blocks:
+            return
+
+        # Compute block hashes for received blocks using the standard
+        # hash_chain algorithm.
+        block_hashes = self.req_to_block_hashes[req_id]
+        if not block_hashes:
+            block_hashes = hash_request_tokens(self.block_size, request)
+            self.req_to_block_hashes[req_id] = block_hashes
+
+        # Register each full block into the prefix cache.
+        num_full_blocks = num_received_tokens // self.block_size
+        num_already_cached = self.num_cached_block.get(req_id, 0)
+
+        for blk_idx in range(num_already_cached, num_full_blocks):
+            if blk_idx >= len(req_blocks) or blk_idx >= len(block_hashes):
+                break
+
+            block = req_blocks[blk_idx]
+            block_hash = block_hashes[blk_idx]
+
+            # Only register if the block doesn't already have a hash.
+            if block.block_hash is None:
+                block.block_hash = block_hash
+                self.cached_block_hash_to_block[block_hash][
+                    block.block_id] = block
+
+        self.num_cached_block[req_id] = max(
+            num_already_cached, num_full_blocks)
