@@ -59,6 +59,7 @@ class EngineCoreRequest(
     eos_token_id: Optional[int]
     arrival_time: float
     lora_request: Optional[LoRARequest]
+    tenant_id: str = "default"
 
 
 class EngineCoreEventType(enum.IntEnum):
