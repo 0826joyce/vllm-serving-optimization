@@ -94,6 +94,7 @@ class Processor:
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
         tenant_id: str = "default",
+        sla_ttft_ms: float = float('inf'),
     ) -> EngineCoreRequest:
 
         # TODO(woosuk): Support pooling models.
@@ -233,6 +234,7 @@ class Processor:
             arrival_time=arrival_time,
             lora_request=lora_request,
             tenant_id=tenant_id,
+            sla_ttft_ms=sla_ttft_ms,
         )
 
     def _validate_model_inputs(self, inputs: ProcessorInputs):

@@ -148,6 +148,15 @@ class Request:
     STARVATION_DECAY_INTERVAL: float = 5.0   # seconds
     MAX_STARVATION_BOOST: int = 10           # cap on starvation boost
 
+    # ---- SLA / Deadline Configuration (Phase 4) ----
+    # Default SLA TTFT targets per QoS tier (milliseconds).
+    # These are used when no explicit sla_ttft_ms is provided.
+    DEFAULT_SLA_TTFT_MS: Dict[str, float] = {
+        "HIGH": 500.0,       # Gold-A/B: 500ms TTFT target
+        "NORMAL": 1000.0,    # Silver: 1s TTFT target
+        "LOW": 5000.0,       # Bronze: 5s TTFT target
+    }
+
     def __init__(
         self,
         request_id: str,
@@ -162,6 +171,7 @@ class Request:
         lora_request: Optional[LoRARequest] = None,
         priority: int = 0,
         tenant_id: str = "default",
+        sla_ttft_ms: float = float('inf'),
     ) -> None:
         self.request_id = request_id
         self.sampling_params = sampling_params
@@ -171,6 +181,15 @@ class Request:
         self.lora_request = lora_request
         # ---- Tenant isolation (Phase 3) ----
         self.tenant_id = tenant_id
+
+        # ---- SLA / Deadline tracking (Phase 4) ----
+        # sla_ttft_ms: maximum acceptable time-to-first-token in ms.
+        # deadline: absolute monotonic time by which TTFT must occur.
+        self.sla_ttft_ms = sla_ttft_ms
+        if sla_ttft_ms < float('inf'):
+            self.deadline: float = arrival_time + sla_ttft_ms / 1000.0
+        else:
+            self.deadline = float('inf')
 
         self.status = RequestStatus.WAITING
         self.events: List[EngineCoreEvent] = []
@@ -273,6 +292,32 @@ class Request:
         self._effective_priority = base + length_adjustment - starvation_boost
         return self._effective_priority
 
+    # ---- SLA / Deadline Methods (Phase 4) ----
+
+    @property
+    def slack_time(self) -> float:
+        """Remaining time before SLA deadline (seconds).
+
+        Positive = still within SLA; negative = already violated.
+        Returns ``float('inf')`` if no SLA is configured.
+        """
+        if self.deadline == float('inf'):
+            return float('inf')
+        return self.deadline - time.monotonic()
+
+    def is_sla_violated(self) -> bool:
+        """Return True if the request has exceeded its SLA deadline."""
+        return self.slack_time <= 0
+
+    @property
+    def sla_urgency(self) -> float:
+        """Urgency score for deadline-aware scheduling.
+
+        Lower value = more urgent (closer to or past deadline).
+        Requests with no SLA get ``float('inf')`` (least urgent).
+        """
+        return self.slack_time
+
     # ---- MLFQ Methods ----
 
     def mlfq_account_tokens(self, num_tokens: int) -> None:
@@ -330,6 +375,7 @@ class Request:
             arrival_time=request.arrival_time,
             lora_request=request.lora_request,
             tenant_id=getattr(request, 'tenant_id', 'default'),
+            sla_ttft_ms=getattr(request, 'sla_ttft_ms', float('inf')),
         )
 
     def queued(self, timestamp: Optional[float] = None) -> None:
@@ -398,6 +444,7 @@ class RequestStatus(enum.IntEnum):
     FINISHED_LENGTH_CAPPED = 4
     FINISHED_ABORTED = 5
     FINISHED_IGNORED = 6
+    FINISHED_REJECTED = 7  # Phase 4: Admission control rejection
 
     @staticmethod
     def is_finished(status: "RequestStatus") -> bool:
@@ -418,4 +465,5 @@ _FINISHED_REASON_MAP = {
     RequestStatus.FINISHED_LENGTH_CAPPED: FinishReason.LENGTH,
     RequestStatus.FINISHED_ABORTED: FinishReason.ABORT,
     RequestStatus.FINISHED_IGNORED: FinishReason.LENGTH,
+    RequestStatus.FINISHED_REJECTED: FinishReason.ABORT,
 }

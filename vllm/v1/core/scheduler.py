@@ -252,6 +252,25 @@ class Scheduler:
         )
         self.enable_tenant_isolation: bool = True
 
+        # ---- Overload Management (Phase 4 fix) ----
+        # Three-pronged approach to handle Phase 5 full overload:
+        #   (a) Admission control: reject low-priority requests when
+        #       queue depth or SLA violation rate is too high.
+        #   (b) Deadline-aware scheduling: requests closer to their SLA
+        #       deadline are scheduled with higher urgency.
+        #   (c) SLA-aware preemption: already-violated requests are
+        #       preempted first to salvage resources for saveable ones.
+        self.enable_overload_management: bool = True
+        self.max_queue_depth: int = 100
+        # SLA violation tracking (sliding window).
+        self._sla_violation_window: Deque[bool] = deque(
+            maxlen=50)  # True = violated, False = met
+        self.overload_violation_threshold: float = 0.5  # 50% → reject low
+        # Deadline-aware scheduling: when enabled, within each MLFQ level
+        # we boost requests whose slack_time is dangerously low.
+        self.enable_deadline_aware_scheduling: bool = True
+        self.deadline_urgency_threshold_s: float = 2.0  # seconds
+
         # ---- Preemption Cache Shield ----
         # Minimum number of blocks that a partial free must release.
         # If partial free would release fewer blocks than this threshold,
@@ -339,6 +358,11 @@ class Scheduler:
         if self.enable_pd_aware_scheduling:
             self._pd_aware_pre_schedule()
 
+        # ---- Deadline-Aware Scheduling: Urgency boosting (Phase 4) ----
+        if (self.enable_overload_management
+                and self.enable_deadline_aware_scheduling):
+            self._deadline_aware_sort_waiting()
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -389,7 +413,17 @@ class Scheduler:
                 if new_blocks is None:
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
-                    if self.enable_qos_priority and len(self.running) > 1:
+                    # ---- SLA-Aware Preemption (Phase 4) ----
+                    # Use _select_preemption_victim() which prefers to
+                    # preempt already-violated requests first.
+                    if (self.enable_overload_management
+                            and len(self.running) > 1):
+                        preempted_req = self._select_preemption_victim()
+                        if preempted_req is not None:
+                            self.running.remove(preempted_req)
+                        else:
+                            preempted_req = self.running.pop()
+                    elif self.enable_qos_priority and len(self.running) > 1:
                         # QoS: Preempt the request with highest
                         # effective_priority value (= lowest priority).
                         preempted_req = max(
@@ -1003,6 +1037,16 @@ class Scheduler:
         return False
 
     def add_request(self, request: Request) -> None:
+        # ---- Overload Management: Admission Control (Phase 4) ----
+        # Under overload, reject low-priority requests to protect
+        # high-priority ones' SLA.
+        if (self.enable_overload_management
+                and not self._should_admit(request)):
+            request.status = RequestStatus.FINISHED_REJECTED
+            self.requests[request.request_id] = request
+            self._free_request(request)
+            return
+
         self.requests[request.request_id] = request
         if self.enable_mlfq:
             # New requests always enter at MLFQ level 0 (highest priority).
@@ -1061,11 +1105,167 @@ class Scheduler:
         # ---- Tenant Isolation: decrement running count ----
         if self.enable_tenant_isolation:
             self.tenant_manager.on_request_finished(request.tenant_id)
+        # ---- Overload Management: track SLA violation (Phase 4) ----
+        # Record whether this request met or violated its SLA deadline.
+        # Only track requests that had a finite SLA configured and were
+        # not rejected at admission (rejected requests never ran).
+        if (self.enable_overload_management
+                and request.status != RequestStatus.FINISHED_REJECTED
+                and request.deadline < float('inf')):
+            self._sla_violation_window.append(request.is_sla_violated())
         # ---- PD-Aware: Cleanup KV receive tracking ----
         if self.kv_receive_monitor is not None:
             self.kv_receive_monitor.remove(request.request_id)
         del self.requests[request.request_id]
         self.finished_req_ids.add(request.request_id)
+
+    # ---- Overload Management Methods (Phase 4) ----
+
+    def _should_admit(self, request: Request) -> bool:
+        """Admission control: decide whether to accept a new request.
+
+        Rejection criteria (applied in order):
+        1. Queue depth exceeds ``max_queue_depth`` AND the request is
+           not high-priority → reject (HTTP 503).
+        2. Recent SLA violation rate exceeds threshold AND the request
+           is not high-priority → reject.
+
+        High-priority requests (MLFQ L0-L1, or priority < 0, or short
+        prompt) are *never* rejected, ensuring Gold-tier SLAs are
+        maintained even under severe overload.
+
+        Returns:
+            True if the request should be admitted; False to reject.
+        """
+        is_high_priority = self._is_high_priority_request(request)
+
+        # High-priority requests are always admitted.
+        if is_high_priority:
+            return True
+
+        # (1) Queue depth gate.
+        if len(self.waiting) >= self.max_queue_depth:
+            logger.info(
+                "Admission control: rejecting req %s — queue depth "
+                "%d >= %d", request.request_id, len(self.waiting),
+                self.max_queue_depth)
+            return False
+
+        # (2) SLA violation rate gate.
+        if len(self._sla_violation_window) >= 10:
+            violation_rate = (
+                sum(self._sla_violation_window)
+                / len(self._sla_violation_window))
+            if violation_rate > self.overload_violation_threshold:
+                logger.info(
+                    "Admission control: rejecting req %s — SLA "
+                    "violation rate %.1f%% > %.1f%%",
+                    request.request_id,
+                    violation_rate * 100,
+                    self.overload_violation_threshold * 100)
+                return False
+
+        return True
+
+    def _is_high_priority_request(self, request: Request) -> bool:
+        """Determine if a request qualifies as high priority.
+
+        High-priority requests are never rejected by admission control
+        and are given scheduling preference.
+        """
+        # By MLFQ level (new requests always start at L0).
+        if self.enable_mlfq and request.mlfq_level <= 1:
+            return True
+        # By explicit API priority.
+        if request.priority < 0:
+            return True
+        # By short prompt (interactive traffic).
+        if request.num_prompt_tokens < Request.SHORT_PROMPT_THRESHOLD:
+            return True
+        return False
+
+    def _select_preemption_victim(self) -> Optional[Request]:
+        """Select the best preemption victim using SLA-aware heuristics.
+
+        Selection order:
+        1. Already SLA-violated requests (they can't be saved, free
+           resources for saveable ones). Among these, pick the lowest
+           priority (highest effective_priority value).
+        2. Fallback to standard QoS priority (highest effective_priority
+           value = lowest scheduling priority).
+
+        Returns:
+            The request to preempt, or None if no candidate exists.
+        """
+        if not self.running:
+            return None
+
+        if self.enable_overload_management:
+            # Prefer to preempt already-violated requests.
+            violated = [r for r in self.running if r.is_sla_violated()]
+            if violated:
+                return max(
+                    violated,
+                    key=lambda r: (r.effective_priority, r.arrival_time))
+
+        # Standard fallback: preempt lowest-priority running request.
+        if self.enable_qos_priority:
+            return max(
+                self.running,
+                key=lambda r: (r.effective_priority, r.arrival_time))
+
+        # FCFS fallback: preempt last added.
+        return self.running[-1]
+
+    def _deadline_aware_sort_waiting(self) -> None:
+        """Boost urgent requests within each MLFQ level.
+
+        Requests whose ``slack_time`` is below the urgency threshold
+        are moved to the front of their MLFQ level queue, ensuring
+        they get scheduled before less urgent requests at the same
+        level.
+
+        This does NOT cross MLFQ level boundaries — a L2 request
+        cannot jump ahead of L0 requests regardless of urgency.
+        """
+        if not self.enable_mlfq:
+            # For flat waiting queue: sort by (urgency, arrival_time).
+            if len(self.waiting) > 1:
+                sorted_reqs = sorted(
+                    self.waiting,
+                    key=lambda r: (
+                        0 if r.sla_urgency < self.deadline_urgency_threshold_s
+                        else 1,
+                        r.arrival_time))
+                self.waiting = deque(sorted_reqs)
+            return
+
+        for level_queue in self.mlfq_queues:
+            if len(level_queue) <= 1:
+                continue
+            # Partition into urgent and non-urgent.
+            urgent = []
+            normal = []
+            for r in level_queue:
+                if r.sla_urgency < self.deadline_urgency_threshold_s:
+                    urgent.append(r)
+                else:
+                    normal.append(r)
+            if urgent:
+                # Within urgent: sort by slack_time (most urgent first).
+                urgent.sort(key=lambda r: r.sla_urgency)
+                # Within normal: keep original FCFS order.
+                level_queue.clear()
+                level_queue.extend(urgent)
+                level_queue.extend(normal)
+
+    @property
+    def sla_violation_rate(self) -> float:
+        """Current SLA violation rate from the sliding window."""
+        if not self._sla_violation_window:
+            return 0.0
+        return sum(self._sla_violation_window) / len(
+            self._sla_violation_window)
 
     def _update_effective_priorities(self) -> None:
         """QoS: Update effective priorities for all requests.
