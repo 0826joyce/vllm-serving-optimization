@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from collections import defaultdict
-from typing import DefaultDict, Dict, Iterable, List, Optional, Tuple
+from typing import DefaultDict, Dict, Iterable, List, Optional, Tuple, Deque
+from collections import deque
 
 from vllm.logger import init_logger
 from vllm.utils import cdiv
@@ -89,6 +90,13 @@ class KVCacheManager:
         self.num_cached_block: Dict[str, int] = defaultdict(int)
         self.prefix_cache_stats = PrefixCacheStats()
 
+        # ---- Cache version management: hit-rate monitoring ----
+        self._hit_rate_window: Deque[float] = deque(maxlen=100)
+        self._cache_health_check_interval = 10
+        self._cache_health_counter = 0
+        self._default_protected_ratio = 0.5
+        self._protected_ratio_shrunk = False  # Track whether we've shrunk
+
     @property
     def usage(self) -> float:
         """Get the KV cache usage.
@@ -147,6 +155,17 @@ class KVCacheManager:
         self.prefix_cache_stats.requests += 1
         self.prefix_cache_stats.queries += len(block_hashes)
         self.prefix_cache_stats.hits += len(computed_blocks)
+
+        # ---- Cache version management: record hit rate ----
+        num_hashes = len(block_hashes)
+        if num_hashes > 0:
+            hit_rate = len(computed_blocks) / num_hashes
+            self._hit_rate_window.append(hit_rate)
+
+            self._cache_health_counter += 1
+            if self._cache_health_counter >= self._cache_health_check_interval:
+                self._check_cache_health()
+                self._cache_health_counter = 0
 
         # NOTE(woosuk): Since incomplete blocks are not eligible for
         # sharing, `num_computed_tokens` is always a multiple of
@@ -613,6 +632,50 @@ class KVCacheManager:
             blk.block_hash = block_hash
             self.cached_block_hash_to_block[block_hash][blk.block_id] = blk
             prev_block_hash_value = block_hash.hash_value
+
+    # ------------------------------------------------------------------
+    # Cache version management: adaptive protected zone resizing
+    # ------------------------------------------------------------------
+
+    def _check_cache_health(self) -> None:
+        """Detect cache health and adaptively resize the protected zone.
+
+        When the hit rate drops sharply (e.g. due to a prompt version
+        switch), we temporarily shrink the protected zone so that stale
+        blocks are demoted to probation and evicted faster, making room
+        for the new prompt's blocks.  Once the hit rate recovers, we
+        restore the original protected ratio.
+
+        Thresholds:
+            - Drop detection: recent 10 avg < 0.3 AND older 10 avg > 0.5
+            - Recovery detection: recent 10 avg > 0.5
+        """
+        window_len = len(self._hit_rate_window)
+        if window_len < 20:
+            return
+
+        # Compute recent vs older average hit rates.
+        # Convert deque to list for slicing (deque doesn't support slicing).
+        window_list = list(self._hit_rate_window)
+        recent = sum(window_list[-10:]) / 10
+        older = sum(window_list[-20:-10]) / 10
+
+        if recent < 0.3 and older > 0.5 and not self._protected_ratio_shrunk:
+            # Hit rate dropped sharply → shrink protected zone.
+            logger.info(
+                "Cache health: hit rate dropped %.2f → %.2f, "
+                "shrinking protected zone to 10%%", older, recent)
+            self.free_block_queue.resize_protected(0.1)
+            self._protected_ratio_shrunk = True
+        elif recent > 0.5 and self._protected_ratio_shrunk:
+            # Hit rate recovered → restore protected zone.
+            logger.info(
+                "Cache health: hit rate recovered to %.2f, "
+                "restoring protected zone to %.0f%%",
+                recent, self._default_protected_ratio * 100)
+            self.free_block_queue.resize_protected(
+                self._default_protected_ratio)
+            self._protected_ratio_shrunk = False
 
     def free_block_hashes(self, request: Request) -> None:
         """Discard the block hashes for the request.
