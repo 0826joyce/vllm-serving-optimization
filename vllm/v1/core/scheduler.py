@@ -232,6 +232,15 @@ class Scheduler:
         # for high-priority requests.
         self.enable_token_rate_limiting: bool = True
 
+        # ---- Prefill Budget Isolation (Phase 2 fix) ----
+        # Prevents long-prefill requests (e.g. 4096-token Bronze documents)
+        # from starving short interactive requests (Gold-A/Silver) by:
+        # 1. Reserving a portion of token_budget for short requests.
+        # 2. Limiting the number of concurrent long prefills per step.
+        self.long_prefill_threshold: int = 1024  # tokens
+        self.short_budget_reserve_ratio: float = 0.3  # 30% for short reqs
+        self.max_concurrent_long_prefill: int = 2
+
         # ---- Preemption Cache Shield ----
         # Minimum number of blocks that a partial free must release.
         # If partial free would release fewer blocks than this threshold,
@@ -483,6 +492,11 @@ class Scheduler:
         # new tokens and are therefore scheduled first, maximising
         # token_budget utilisation and reducing TTFT.
         if not preempted_reqs:
+            # ---- Prefill Budget Isolation: per-step state ----
+            long_prefill_count = 0
+            short_budget_reserved = int(
+                token_budget * self.short_budget_reserve_ratio)
+
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
@@ -561,6 +575,28 @@ class Scheduler:
                     computed_blocks.pop()
                 num_new_tokens = min(num_new_tokens, token_budget)
                 assert num_new_tokens > 0
+
+                # ---- Prefill Budget Isolation: long prefill control ----
+                # A "long prefill" is a first-time prefill (no computed
+                # tokens yet) whose new tokens exceed the threshold.
+                is_long_prefill = (
+                    num_new_tokens > self.long_prefill_threshold
+                    and request.num_computed_tokens == 0)
+
+                if is_long_prefill:
+                    # (a) Concurrent long-prefill cap.
+                    if long_prefill_count >= self.max_concurrent_long_prefill:
+                        # Don't schedule more long prefills this step;
+                        # leave budget for short requests.
+                        break
+
+                    # (b) Long prefill must not eat into the short-
+                    #     request reserved budget.
+                    effective_budget = token_budget - short_budget_reserved
+                    if effective_budget <= 0:
+                        break
+                    num_new_tokens = min(num_new_tokens, effective_budget)
+                    long_prefill_count += 1
 
                 # Schedule encoder inputs.
                 (encoder_inputs_to_schedule, num_new_tokens,
