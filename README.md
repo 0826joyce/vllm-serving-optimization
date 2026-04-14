@@ -1,562 +1,341 @@
-# 基于 vLLM V1 的推理引擎 QoS 与时延优化
+# 基于 vLLM V1 的 LLM 推理引擎全栈优化
 
-> 结合云网络虚拟网关流量调度 + 云存储限速/时延优化经验，实现大模型推理引擎的高优保障与资源可控性
+> 覆盖调度与资源管理、KV Cache 管理、投机解码、分布式架构（PD 分离）四大方向，基于 vLLM V1 源码二次开发
 
-## 项目背景
+## 项目概述
 
-大模型推理引擎本质是**高并发请求的调度、资源管控与时延抖动控制**，与云网络虚拟网关（流量转发/优先级调度）、云存储（时延优化/限速流控）工作高度同源。
+本项目基于 **vLLM V1 架构**（v0.7.3），对 LLM 推理引擎进行系统级优化。将云网络（流量调度/优先级转发）、云存储（时延优化/限速流控/分层存储）的核心 Infra 经验迁移至大模型推理场景，从**调度策略、KV Cache 管理、投机解码、分布式架构**四大维度全面提升推理服务的时延、吞吐和稳定性。
 
-本项目基于 **vLLM V1 架构**源码二次开发，将云原生 Infra 的核心能力平移至 LLM 推理场景，解决线上推理的核心痛点：
+### 项目定位
 
-1. 长请求占满资源，导致短请求尾时延飙升（Head-of-Line Blocking）；
-2. KV 缓存显存抢占严重，V1 无水位线/配额控制，抢占代价极高（需从头 Recompute）；
-3. KV Cache 仅驻留 GPU 显存，无分层存储，长上下文（128K+）易打爆单卡显存；
-4. 资源无配额限制，无准入控制，服务质量不可控；
-5. 缺少时间感知调度，无 Deadline/SLA 机制；
-6. 缺少多租户公平性保障，无加权调度与配额隔离能力。
+LLM 推理优化的完整图谱包含 6 大方向。本项目聚焦其中 4 个，覆盖推理链路的全部关键环节：
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                         LLM 推理优化全景图                                     │
+├────────────────────────┬─────────────────────────────────────────────────────┤
+│ 1. 调度与资源管理       │ ✅ 本项目核心方向 — 8 个优化点（3 已实现）            │
+│ 2. KV Cache 管理       │ ✅ 本项目核心方向 — 5 个优化点（3 已实现）            │
+│ 3. 投机解码            │ ✅ 本项目设计方向 — 5 个优化点（设计完成）            │
+│ 4. 分布式架构(PD分离)   │ ✅ 本项目规划方向 — 6 个优化点（设计完成）            │
+│ 5. 模型压缩/量化       │ ⬜ 不在当前范围（需模型侧配合）                       │
+│ 6. Attention/算子优化   │ ⬜ 不在当前范围（FlashAttention 等已由社区覆盖）      │
+├────────────────────────┼─────────────────────────────────────────────────────┤
+│ ★ 端到端业务场景验证    │ ✅ 5 阶段递进加压 + 5 项增量修复（workload 已完成）   │
+│                        │    从框架优化 → 业务优化的完整闭环                    │
+└────────────────────────┴─────────────────────────────────────────────────────┘
+```
 
 ### V1 架构关键特征（本项目基于此开发）
 
-| 特征 | V1 现状 | 优化空间 |
-|------|---------|----------|
-| 调度策略 | 仅 FCFS（先来先服务） | 无优先级、无公平性、无时间感知 |
-| 优先级支持 | `assert priority == 0`（硬编码禁用） | 需解除限制，引入优先级框架 |
-| 抢占策略 | LIFO + Recompute（代价极高） | 需按优先级抢占，减少抢占频率 |
-| KV Cache 管理 | 有 `usage` 上报，无水位线/配额 | V0 有 watermark，V1 缺失 |
-| KV Cache 存储 | 仅 GPU 显存，无分层 | V0 有 swap（已移除），需三级分层 |
-| 准入控制 | 无（任何请求直接入队） | 无过载保护机制 |
-| 速率控制 | 无 token 级限速 | 无法精细化控制单请求资源消耗 |
-
-## 技术核心 & 实现方案
-
-> 📋 **实现规划**：共 8 个优化点，按优先级从 P0 到 P3 逐步实现。每个优化点独立可用，高优先级的先实现。
+| 特征 | V1 现状 | 本项目优化 |
+|------|---------|-----------|
+| 调度策略 | 仅 FCFS（先来先服务） | QoS 分级 + MLFQ 自适应 + Token 限速 |
+| 抢占策略 | LIFO（Recompute 代价极高） | 优先级感知抢占 + 缓存保护 |
+| KV Cache 管理 | Prefix Caching + 简单 LRU | Cache-Aware 调度 + Segmented LRU + 抢占保护 |
+| 投机解码 | 仅 N-gram Proposer | 后缀树 Proposer + 增量后缀自动机 |
+| PD 分离 | 仅 V0 支持，V1 无任何代码 | V1 适配 + 智能路由 + 传输优化 |
 
 ---
 
-### 优化 1：推理请求 QoS 分级调度 `[P0]` `[已实现]`
+## 优化方向总览
 
-> 对应能力迁移：**云网络虚拟网关 → 优先级队列 + 高优包优先转发**
+本项目包含 **4 大优化方向 + 1 个端到端验证框架**，共 **24 个优化点**。每个方向有独立的详细设计文档：
 
-#### 核心思路
+### 方向一：调度与资源管理（8 个优化点）
 
-类比网关**高优包优先转发、低时延保障**机制，对推理请求按长度/业务类型分级，保障短对话/搜索类高优请求的低时延体验。
+> **核心思路**：将云网络/存储的调度、限速、时延优化能力迁移至推理引擎调度器
 
-#### vLLM V1 现状分析
+| # | 优化点 | 优先级 | 状态 | Infra 能力对标 |
+|---|--------|--------|------|---------------|
+| 1 | QoS 分级调度 | P0 | ✅ 已实现 | 网关优先级队列 + 高优包优先转发 |
+| 2 | KV 缓存显存水位线与配额流控 | P0 | 🔲 未实现 | 存储水位线 + IO 配额 |
+| 3 | 请求准入控制 | P1 | 🔲 未实现 | ECN 显式拥塞通知 + RED 随机早期丢弃 |
+| 4 | Token 级速率控制 | P1 | ✅ 已实现 | 令牌桶 / 漏桶限速 |
+| 5 | Deadline-aware 调度 | P2 | 🔲 未实现 | EDF + fq_codel / HFSC |
+| 6 | 加权公平队列 WFQ 调度 | P2 | 🔲 未实现 | WFQ / DRR + per-tenant 配额 |
+| 7 | MLFQ 多级反馈队列 | P3 | ✅ 已实现 | OS MLFQ / CFS |
+| 8 | KV Cache 分层存储与智能迁移 | P1 | 🔲 未实现 | 存储热温冷分层 + 预取 |
 
-- V1 调度器（`vllm/v1/core/sched/scheduler.py`）已支持 FCFS 和 Priority 两种策略，但 Priority 模式仅使用静态 `priority` 值
-- `vllm/v1/engine/input_processor.py` 已允许传入 `priority` 参数（无 assert 限制）
-- Priority 模式下抢占已选择最低优先级请求（`max(self.running, key=lambda r: (r.priority, r.arrival_time))`）
-- 但**缺少多维优先级计算**：没有综合 prompt 长度分级和等待时间防饿死因子
+**已实现优化的核心设计**：
 
-#### 实现细节
+- **QoS 分级调度**：综合 API 传入的业务优先级 + prompt 长度分级 + 等待时间衰减因子，动态计算 `effective_priority`，保障短请求低时延
+- **Token 限速**：Per-request 令牌桶机制，高负载下低优请求限速（rate=8-50 tokens/step），高优请求不限速，避免硬性抢占
+- **MLFQ 多级反馈**：4 级队列（Interactive/Standard/Batch/Background），请求按实际 token 消耗自动降级，无需人工标注优先级
 
-- 修改文件：
-  - `vllm/v1/request.py` — Request 类新增多维优先级计算（`effective_priority` 属性）
-  - `vllm/v1/core/sched/scheduler.py` — 调度器集成动态优先级更新
-- 核心逻辑：
-  1. **多维优先级计算**：综合 API 传入的业务优先级（`priority` 字段）+ `num_prompt_tokens` 长度分级（短请求 <512 token 为高优）+ 等待时间衰减因子（防饿死）；
-  2. **动态优先级更新**：每个调度步开始时，更新所有 waiting 请求的 `effective_priority`，使等待时间越长的请求优先级自动提升；
-  3. **优先级感知调度**：`waiting` 队列使用 `PriorityRequestQueue`，基于 `effective_priority` 排序；
-  4. **优先级感知抢占**：抢占时选择 `self.running` 中 `effective_priority` 值最大（优先级最低）的请求。
-
-#### 预期效果
-
-- 短请求（<512 token）平均 TTFT（首 token 时延）显著降低
-- 消除长 prefill 对短请求的 Head-of-Line Blocking
-- 等待时间衰减因子确保低优请求不会被永远饿死
-
----
-
-### 优化 2：KV 缓存显存水位线与配额流控 `[P0]` `[未实现]`
-
-> 对应能力迁移：**云存储 IO QoS → 水位线流控 + per-request 带宽配额**
-
-#### 核心思路
-
-借鉴云存储**流量整形、分级水位线、per-request 带宽配额**思想，对 KV 缓存实现显存资源管控，避免显存抢占与抖动。
-
-#### vLLM V1 现状分析
-
-- V1 的 `KVCacheManager`（`vllm/v1/core/kv_cache_manager.py`）只有 `usage` 属性上报使用率，**没有任何水位线机制**
-- V0 的 `BlockManager`（`vllm/core/block_manager.py`）有 `watermark_blocks = int(watermark * num_gpu_blocks)` 水位线，但 **V1 完全移除了**
-- V1 分配失败时直接触发抢占（Recompute 代价极高），没有任何缓冲/降级/限流机制
-- 没有单请求 KV 块配额限制，单个长请求可占满所有显存
-
-#### 实现细节
-
-- 修改文件：
-  - `vllm/v1/core/kv_cache_manager.py` — 水位线和配额逻辑
-  - `vllm/v1/core/scheduler.py` — 调度器读取水位线状态做决策
-- 核心逻辑：
-  1. **多级水位线机制**（类比存储高低水位）：
-     - 🟢 绿色（usage < 70%）：自由调度，所有请求正常分配
-     - 🟡 黄色（70% ≤ usage < 85%）：拒绝新的低优请求入队，限制单请求 block 分配增速
-     - 🔴 红色（usage ≥ 85%）：仅允许高优短请求，触发主动 LRU 回收
-  2. **单请求 KV 块动态配额**：配额不是固定值，而是根据请求优先级 × 当前水位动态调整：
-     - `max_blocks_per_req = base_quota × priority_factor × (1 - usage)`
-  3. **主动回收**：水位超过黄色阈值时，主动释放 `FreeKVCacheBlockQueue` 中 `ref_cnt == 0` 的 prefix cache blocks，不等到分配失败才触发抢占。
-
-#### 预期效果
-
-- 显存占用峰值显著降低（从被动抢占变为主动控制）
-- OOM 概率从抢占式兜底降至水位线防御，稳定性大幅提升
-- 抢占频率降低（水位线提前拦截，减少 Recompute 开销）
-
----
-
-### 优化 3：请求准入控制 `[P1]` `[未实现]`
-
-> 对应能力迁移：**网络流量整形 Traffic Shaping → ECN 显式拥塞通知 + RED 随机早期丢弃**
-
-#### 核心思路
-
-从请求入口处做准入判断，在系统过载前主动拒绝/降级，避免所有请求挤入队列后才被动抢占。类比网络 ECN + RED：**在拥塞发生前就开始控制流入**。
-
-#### vLLM V1 现状分析
-
-- 任何请求到达后直接进入 `waiting` 队列，没有任何准入门槛
-- 系统过载时只能依赖调度器的抢占机制（代价极高）来事后补救
-- 没有队列深度限制，waiting 队列可以无限增长
-
-#### 实现细节
-
-- 修改文件：
-  - `vllm/v1/engine/processor.py` — 请求入口处新增准入判断
-  - `vllm/v1/core/kv_cache_manager.py` — 暴露水位线状态接口
-- 核心逻辑：
-  1. **基于 KV Cache 水位的准入控制**：
-     ```
-     if kv_usage > RED_WATERMARK:
-         仅放行 priority == HIGH 的请求
-     elif kv_usage > YELLOW_WATERMARK:
-         拒绝预估 KV 占用大于阈值的新请求（按 prompt_token_count 预估）
-     else:
-         自由放行
-     ```
-  2. **基于队列深度的准入控制**：
-     ```
-     if len(waiting) > MAX_QUEUE_DEPTH:
-         拒绝请求，返回 503 Service Unavailable（带 Retry-After）
-     ```
-  3. **拒绝策略**：被拒绝的请求不是直接丢弃，而是返回明确的错误码和重试建议（类比网络 ECN 通知上游降速）。
-
-#### 预期效果
-
-- 从源头控制系统负载，避免抢占风暴
-- 系统在高负载下保持稳定的服务质量，而非全面退化
-
----
-
-### 优化 4：Token 级速率控制 `[P1]` `[未实现]`
-
-> 对应能力迁移：**云存储 IO 限速 → 令牌桶（Token Bucket）/ 漏桶（Leaky Bucket）**
-
-#### 核心思路
-
-借鉴存储 IO QoS 中的**令牌桶限速**机制，对低优请求实施 token 生成速率限制，将计算资源让给高优请求，而非简单粗暴地抢占（抢占 = Recompute，代价极高）。
-
-#### vLLM V1 现状分析
-
-- 没有任何 token 级速率控制
-- 每个请求被调度后，以系统最大速度消耗 token_budget，无法控制单请求的资源消耗速率
-- 调度器的 `token_budget` 是全局共享的，没有 per-request 预算分配机制
-
-#### 实现细节
-
-- 修改文件：
-  - `vllm/v1/core/scheduler.py` — 调度时按速率限制分配 token 数
-  - `vllm/v1/request.py` — Request 新增速率控制状态
-- 核心逻辑：
-  1. **Per-request 令牌桶**：
-     ```python
-     class TokenRateLimiter:
-         rate: float    # 每步允许的平均 token 数
-         burst: int     # 突发容量
-         tokens: float  # 当前桶内余量
-     ```
-  2. **差异化限速**：高优请求不限速（rate=∞），低优请求根据当前系统负载动态调整 rate：
-     - 系统空闲时：低优也不限速（充分利用资源）
-     - 系统繁忙时：低优限速，为高优让出 token_budget
-  3. **集成到调度器**：在 `schedule()` 中计算 `num_new_tokens` 时，叠加速率限制：
-     ```python
-     num_new_tokens = min(num_new_tokens, token_budget, rate_limiter.available())
-     ```
-
-#### 预期效果
-
-- 高负载下高优请求的 TPOT（每 token 时延）更稳定
-- 减少抢占频率（通过限速实现软性资源调节，避免硬性抢占）
-- 整体吞吐不降低（空闲时限速自动放开）
-
----
-
-### 优化 5：Deadline-aware 调度 `[P2]` `[未实现]`
-
-> 对应能力迁移：**网络 QoS Deadline 队列 → fq_codel / HFSC 调度**
-
-#### 核心思路
-
-引入时间感知调度，为每个请求设定 SLA 目标（TTFT 首 token 时延、TPOT 每 token 时延），调度器感知请求的**松弛时间（slack time）**，优先调度最紧急的请求。
-
-#### vLLM V1 现状分析
-
-- **完全没有时间感知**：无 deadline、无 timeout、无 SLA 机制
-- 请求无论等多久都只能被动等待，没有紧急程度概念
-- 没有区分"快要超时的请求"和"刚到的请求"
-
-#### 实现细节
-
-- 修改文件：
-  - `vllm/v1/request.py` — 新增 deadline 和时间感知字段
-  - `vllm/v1/core/scheduler.py` — EDF 调度逻辑
-  - `vllm/v1/engine/processor.py` — API 层支持 deadline / SLA 参数
-- 核心逻辑：
-  1. **请求 SLA 定义**：
-     ```python
-     class Request:
-         deadline: Optional[float]       # 绝对截止时间（秒级时间戳）
-         ttft_target: Optional[float]    # TTFT 目标（如 200ms）
-         tpot_target: Optional[float]    # TPOT 目标（如 50ms/token）
-         sla_class: str = "best_effort"  # SLA 等级: "realtime" / "interactive" / "batch" / "best_effort"
-     ```
-  2. **EDF（Earliest Deadline First）调度算法**：
-     - 核心思想：**deadline 最早的请求最先被调度**，这是实时系统中理论最优的单处理器调度算法
-     - 对 `waiting` 队列按 deadline 排序，deadline 最早的排队首
-     - 对于没有显式 deadline 的请求，根据 `sla_class` 自动推算：
-       ```python
-       def compute_deadline(request: Request) -> float:
-           if request.deadline is not None:
-               return request.deadline
-           # 根据 SLA 等级自动推算
-           base_latency = {
-               "realtime": 0.1,      # 100ms 内必须出首 token
-               "interactive": 0.5,   # 500ms 内
-               "batch": 5.0,         # 5s 内
-               "best_effort": float('inf'),  # 无期限
-           }
-           return request.arrival_time + base_latency[request.sla_class]
-       ```
-  3. **松弛时间（Slack Time）感知**：
-     ```
-     slack_time = deadline - now - estimated_remaining_time
-     ```
-     - slack_time > 0：还有余量，可以等待
-     - slack_time ≈ 0：紧急，必须立即调度
-     - slack_time < 0：已超期，触发降级或主动释放
-  4. **超时处理策略**（类比网络丢弃过期包）：
-     - 超过 deadline 且尚未开始 prefill → 主动丢弃，返回 408 Timeout
-     - 超过 deadline 但已在生成中 → 标记为低优，不再抢占其他请求的资源
-     - 所有超时释放的资源立即回收给紧急请求
-
-#### 预期效果
-
-- TTFT P99 尾时延显著降低（EDF 保证最紧急请求最先处理）
-- 资源不浪费在注定超时的请求上
-- 支持精细化 SLA 分级（realtime / interactive / batch / best_effort）
-- 这是 vLLM 社区目前**完全没有人在做**的方向
-
----
-
-### 优化 6：加权公平队列 WFQ 调度 `[P2]` `[未实现]`
-
-> 对应能力迁移：**网络 WFQ/DRR 流量调度 → 多租户加权公平**
-
-#### 核心思路
-
-借鉴网络调度中的 **WFQ（Weighted Fair Queuing）/ DRR（Deficit Round Robin）** 算法，在多租户推理场景下，按权重公平分配 GPU 计算资源。
-
-#### vLLM V1 现状分析
-
-- 只有 FCFS 和静态 Priority 两种策略
-- 没有任何公平性保障：一个租户的大量请求可以饿死其他租户
-- 没有"租户"维度的概念
-
-#### 实现细节
-
-- 修改文件：
-  - `vllm/v1/core/scheduler.py` — WFQ 调度逻辑 + token budget 池化
-  - `vllm/v1/request.py` — 新增 tenant_id 字段
-  - `vllm/v1/engine/processor.py` — API 层支持 tenant_id 参数
-  - 新增 `vllm/v1/core/tenant_manager.py` — 租户配额管理
-- 核心逻辑：
-  1. **租户队列**：按 `tenant_id` 分组，每个租户独立 waiting 队列
-  2. **虚拟时间戳调度（WFQ）**：
-     ```python
-     class WFQScheduler:
-         queues: Dict[str, Deque[Request]]  # 租户 → 请求队列
-         weights: Dict[str, float]          # 租户 → 权重
-         virtual_time: Dict[str, float]     # 租户 → 虚拟时间戳
-         
-         def select_next(self) -> Request:
-             # 选 virtual_time 最小的租户的队首请求
-             tenant = min(active_tenants, key=lambda t: virtual_time[t])
-             req = queues[tenant].popleft()
-             virtual_time[tenant] += cost / weights[tenant]
-             return req
-     ```
-  3. **租户级 Token Budget 池化**（类比存储 QoS 的 per-tenant IOPS 配额）：
-     - 每个租户分配独立的 token budget 池，全局 `max_num_batched_tokens` 按权重划分：
-       ```python
-       class TenantManager:
-           tenant_budgets: Dict[str, int]  # 租户 → 当前可用 token budget
-           
-           def allocate_budgets(self, total_budget: int):
-               """每个调度步开始时，按权重分配 token budget"""
-               total_weight = sum(self.weights.values())
-               for tenant_id, weight in self.weights.items():
-                   self.tenant_budgets[tenant_id] = int(
-                       total_budget * weight / total_weight
-                   )
-           
-           def try_consume(self, tenant_id: str, tokens: int) -> int:
-               """租户消耗 token budget，返回实际可用量"""
-               available = self.tenant_budgets[tenant_id]
-               consumed = min(tokens, available)
-               self.tenant_budgets[tenant_id] -= consumed
-               return consumed
-       ```
-     - **Budget 借用机制**：当某租户空闲时，其未使用的 budget 可被其他租户借用（work-conserving），但有借用上限（防止突发霸占）
-  4. **KV Cache 配额隔离**：每个租户的 KV blocks 总占用不超过配额上限
-     ```python
-     max_kv_blocks_per_tenant = total_gpu_blocks * weight / total_weight * 1.2  # 允许 20% 超售
-     ```
-  5. **权重可配置**：通过 API 或配置文件设定租户权重，支持动态调整（热更新）
-
-#### 预期效果
-
-- 多租户场景下各租户按权重获得 GPU 时间片
-- 避免单个租户的突发流量饿死其他租户
-- 适用于推理服务平台（一个 vLLM 实例服务多个业务线）
-
----
-
-### 优化 7：MLFQ 多级反馈队列 `[P3]` `[未实现]`
-
-> 对应能力迁移：**OS 进程调度 CFS → 多级反馈 + 自适应优先级**
-
-#### 核心思路
-
-借鉴 OS 的 **MLFQ（Multi-Level Feedback Queue）** 调度思想：请求初始进入最高优先级队列，随着消耗的 token_budget 增加逐级降低优先级。短请求天然在高优级别完成，长请求逐渐降级——**无需显式标注优先级即可实现自适应调度**。
-
-#### vLLM V1 现状分析
-
-- 请求优先级是静态的（如果有的话），不会随运行状态变化
-- 没有根据请求运行时"行为"动态调整调度优先级的机制
-- 长请求和短请求在调度上完全平等（FCFS）
-
-#### 实现细节
-
-- 修改文件：
-  - `vllm/v1/core/scheduler.py` — MLFQ 多级队列管理
-  - `vllm/v1/request.py` — 新增 MLFQ 级别状态
-- 核心逻辑：
-  1. **多级队列**：定义 N 个优先级级别（如 4 级），每级有不同的 token 配额（时间片）：
-     ```python
-     LEVELS = [
-         {"quota": 128,  "name": "interactive"},   # L0: 短对话
-         {"quota": 512,  "name": "standard"},       # L1: 普通请求
-         {"quota": 2048, "name": "batch"},           # L2: 长请求
-         {"quota": inf,  "name": "background"},      # L3: 后台任务
-     ]
-     ```
-  2. **降级规则**：请求在当前级别累计消耗的 token 超过该级配额后，降到下一级
-  3. **升级规则**：被抢占的请求回到原级或升一级（防止饿死）
-  4. **调度顺序**：从 L0 开始，当前级别有请求则优先调度，级别内 FCFS
-
-#### 预期效果
-
-- 无需人工标注优先级，系统自动对短请求提供低时延保障
-- 长请求自然降级但不会饿死（有升级兜底）
-- 可作为优化 1（静态 QoS 分级）的最终演进形态
-
----
-
-### 优化 8：KV Cache 分层存储与智能迁移 `[P1]` `[未实现]`
-
-> 对应能力迁移：**存储系统热温冷分层（Hot/Warm/Cold Tiering）+ 块迁移（Block Migration）+ 预取（Prefetch）**
-
-#### 核心思路
-
-将存储系统的**分级存储（Tiered Storage）** 思想引入 KV Cache 管理：把 GPU 显存当 L1 热层、CPU DRAM 当 L2 温层、NVMe SSD 当 L3 冷层，实现 KV Cache 的块级粒度迁移和智能预取，从根本上解决 V1 显存不足时只能 Recompute 的问题。
-
-#### vLLM V1 现状分析
-
-- KV Cache **全量驻留 GPU 显存**，没有任何分层存储机制
-- V0 曾支持 CPU swap（GPU ↔ CPU 全量搬运），但 V1 架构中**完全移除了 swap 功能**
-- 显存不足时唯一选项是 **Recompute**（`num_computed_tokens = 0`，丢弃全部 KV Cache 从头重算），代价极高
-- 长上下文请求（128K+ tokens）容易打爆单卡显存，无法支撑
-- `FreeKVCacheBlockQueue` 只管理 GPU 上的 blocks，没有多级存储抽象
-
-#### 架构设计
-
-```
-当前 V1 架构（单层）：
-
-  ┌───────────────────────────┐
-  │     GPU 显存（唯一层）      │  ← 所有 KV Cache
-  │   PagedAttention Blocks    │  ← 不够 → Recompute（全量重算）
-  └───────────────────────────┘
-
-改造后（三级分层）：
-
-  ┌───────────────────────────┐
-  │   L1: GPU 显存（热层）      │  ← 活跃请求的 KV Cache
-  │   延迟 ~ns, 带宽 ~TB/s     │  ← 直接参与 Attention 计算
-  ├───────────────────────────┤
-  │   L2: CPU DRAM（温层）      │  ← 被抢占/暂停请求的 KV Cache
-  │   延迟 ~μs, PCIe ~64GB/s  │  ← 保留而非丢弃，恢复无需重算
-  ├───────────────────────────┤
-  │   L3: NVMe SSD（冷层）      │  ← 长上下文历史 KV Cache
-  │   延迟 ~ms, 带宽 ~7GB/s    │  ← 128K context 不再打爆显存
-  └───────────────────────────┘
-
-  数据流：
-  ↑ 预取（Prefetch）：L3→L2→L1（请求即将被调度时提前搬运）
-  ↓ 降级（Demote）  ：L1→L2→L3（按优先级/访问热度逐级下沉）
-```
-
-#### 实现细节
-
-- 新增/修改文件：
-  - `vllm/v1/core/kv_cache_manager.py` — 扩展为多级存储管理
-  - `vllm/v1/core/kv_cache_utils.py` — 新增 `TieredBlockPool`，管理三级 block 池
-  - `vllm/v1/core/scheduler.py` — 抢占时降级而非丢弃，调度时触发预取
-  - 新增 `vllm/v1/core/block_migrator.py` — 块迁移引擎
-- 核心逻辑：
-  1. **多级 Block 池**（类比存储分层）：
-     ```python
-     class TieredKVCacheManager:
-         gpu_pool: FreeKVCacheBlockQueue    # L1: GPU 显存
-         cpu_pool: CPUBlockPool             # L2: CPU DRAM（pinned memory）
-         disk_pool: DiskBlockPool           # L3: NVMe SSD（异步 IO）
-         
-         block_location: Dict[int, Tier]    # block_id → 当前所在层级
-     ```
-  2. **块级粒度迁移**（对比 V0 的全量 swap）：
-     - V0 swap 是把整个请求的所有 KV blocks 一次性搬到 CPU，粒度粗、延迟高
-     - 本方案按**单个 block** 粒度迁移，类比存储系统的 **page migration**
-     - 使用 CUDA 异步 memcpy（`cudaMemcpyAsync` + dedicated stream），不阻塞 GPU 计算
-  3. **智能降级策略**（对比简单 LRU）：
-     - 被抢占的请求：KV Cache **降级到 L2（CPU DRAM）** 而非丢弃
-     - 长时间未被调度的温层数据：进一步降级到 L3（NVMe）
-     - 降级决策综合考虑：请求优先级、block 访问热度（last_accessed）、剩余生成量
-     ```python
-     def demote_policy(block: KVCacheBlock) -> Tier:
-         if block.request.priority == HIGH:
-             return Tier.CPU    # 高优请求只降到 CPU，保证快速恢复
-         if time.now() - block.last_accessed > COLD_THRESHOLD:
-             return Tier.DISK   # 长时间未访问降到磁盘
-         return Tier.CPU        # 默认降到 CPU
-     ```
-  4. **智能预取**（类比存储预读）：
-     - 当 waiting 队列中的请求即将被调度时，提前把其 KV Cache 从 L2/L3 搬回 L1
-     - 预取时机：调度器的 `schedule()` 每步结束时，预测下一步可能调度的 top-K 请求，异步发起预取
-     - 预取带宽控制：不能让预取占满 PCIe 带宽影响正常推理，设置预取带宽上限
-     ```python
-     def prefetch_candidates(self) -> List[Request]:
-         """预测下一步最可能被调度的请求"""
-         candidates = sorted(self.waiting, key=lambda r: r.effective_priority)
-         return candidates[:PREFETCH_TOP_K]
-     ```
-  5. **抢占改造**：抢占不再 Recompute，而是降级保存：
-     ```python
-     # 改造前（V1 原版）：
-     preempted_req.num_computed_tokens = 0  # 丢弃，全量重算
-     
-     # 改造后：
-     self.kv_cache_manager.demote_to_cpu(preempted_req)  # 降级到 CPU
-     preempted_req.kv_tier = Tier.CPU  # 标记 KV 所在层级
-     # 恢复时：prefetch 从 CPU 搬回 GPU，无需重算
-     ```
-
-#### 与其他优化点的协同
-
-- **+ 优化 2（水位线流控）**：L1（GPU）水位线达到黄色时，主动触发降级迁移到 L2，而非等到分配失败
-- **+ 优化 1（QoS 分级）**：降级时优先降低优先级的请求的 KV Cache
-- **+ 优化 3（准入控制）**：准入判断时考虑 L2/L3 的可用容量，而非只看 L1
-
-#### 预期效果
-
-- **抢占代价大幅降低**：从 Recompute（全量重算）降为 CPU→GPU memcpy（毫秒级恢复）
-- **支撑长上下文**：128K+ token 请求不再打爆单卡显存，历史 KV Cache 可下沉到 CPU/NVMe
-- **显存利用率提升**：GPU 显存集中服务活跃请求，非活跃数据自动下沉
-- **整体吞吐提升**：减少 Recompute 的 GPU 算力浪费，计算资源更多用于有效推理
-
----
-
-## 优化点总览与依赖关系
-
-```
-优化 1 (QoS 分级调度) ──┐
-                         ├──→ 优化 3 (准入控制) ──→ 优化 5 (Deadline/EDF 调度)
-优化 2 (KV 水位线流控) ──┤         │
-                         │         ├──→ 优化 4 (Token 限速)
-优化 8 (KV 分层存储) ────┘         │
-                         优化 6 (WFQ 加权公平) ──→ 优化 7 (MLFQ 多级反馈)
-```
-
-**依赖说明**：
-- 优化 8（KV 分层存储）与优化 2（水位线流控）紧密协同：水位线触发降级迁移
-- 优化 8 与优化 1（QoS 分级）协同：降级时按优先级选择目标
-- 优化 5（EDF 调度）是优化 1 的时间维度增强，需要优先级框架作为基础
-- 优化 6 和优化 7 相对独立，可与其他优化并行开发
-
-### 优化 1 / 6 / 7 三者协同关系（调度三层架构）
-
-优化 1（QoS 分级调度）、优化 6（WFQ 加权公平）、优化 7（MLFQ 多级反馈队列）解决的是**三个完全不同维度**的调度问题，它们分别回答：
-
-| 维度 | 优化点 | 核心问题 | 类比 |
-|------|--------|---------|------|
-| **租户间** | 优化 6（WFQ） | 每个租户该分到多少 GPU 资源？ | 高速公路按城市分配车道数 |
-| **租户内·请求间** | 优化 1（QoS） | 哪个请求更重要？ | 救护车走应急车道 |
-| **同优先级·请求间** | 优化 7（MLFQ） | 哪个请求更快能完成？ | 超市快速结账通道 |
-
-**为什么三者缺一不可：**
-
-1. **只有优化 1（QoS 分级）不够**：
-   - 优化 1 依赖 API 调用方**显式传入 `priority`**，但并非所有场景都能标注（SaaS 平台、统一网关转发等）
-   - 优先级基于**预估**（如 prompt 长度），但输入短 ≠ 输出短（"写一篇 5000 字论文"只有 15 tokens prompt）
-   - 没有**租户维度**隔离，单租户可发起大量同优先级请求霸占所有资源
-
-2. **只有优化 7（MLFQ）不够**：
-   - MLFQ 根据请求实际 token 消耗**自动推断**优先级，无需人工标注
-   - 但请求刚到达时都从 L0 开始，**无法在入口处区分 VIP 和普通请求**
-   - 同样没有**租户维度**隔离能力
-
-3. **只有优化 6（WFQ）不够**：
-   - WFQ 按租户权重公平分配 GPU 时间，但**租户内部**的请求全部 FCFS
-   - 无法区分同一租户内的高优和低优请求
-
-**三者协同的最终形态：**
+**调度四层架构**：
 
 ```
 请求到达
     │
     ▼
-优化 6（WFQ）：按 tenant_id 分流到各租户队列
-    │          保证每个租户拿到其权重对应的 GPU 份额
+优化 6（WFQ）：按 tenant_id 分流 → 保证租户间公平
     │
-    ├── 租户 A 队列（权重 50%）──┐
-    ├── 租户 B 队列（权重 30%）──┼── 每个租户队列内部：
-    └── 租户 C 队列（权重 20%）──┘
-            │
-            ▼
-    优化 1（QoS 分级）：同一租户内，高优请求先调度
-            │
-            ▼
-    优化 7（MLFQ）：同一优先级内，短请求自动优先
+    ▼
+优化 1（QoS）：同一租户内按 effective_priority 排序
+    │
+    ▼
+优化 7（MLFQ）：同优先级内自适应排序（短请求自动优先）
+    │
+    ▼
+请求被选中，进入 running 状态
+    │
+    ▼
+优化 4（Token 限速）：低优请求限速，为高优让出 token_budget
+    │
+    ▼
+输出 tokens
 ```
 
-| 层级 | 谁来决定 | 决定什么 | 防护的场景 |
-|------|---------|---------|-----------|
-| **租户间** | 优化 6（WFQ） | A 拿 50%，B 拿 30%，C 拿 20% | 大租户突发流量饿死小租户 |
-| **租户内·请求间** | 优化 1（QoS） | VIP 请求先于普通请求 | 低优请求挡住高优请求 |
-| **同优先级·请求间** | 优化 7（MLFQ） | 短请求自动优先于长请求 | 长请求 Head-of-Line Blocking |
+**核心修改文件**：
+- `vllm/v1/core/scheduler.py` — 调度器核心逻辑
+- `vllm/v1/request.py` — Request 类扩展（优先级、MLFQ 级别、速率限制器）
 
-### 优化 4（Token 限速）与优化 1/6/7 的关系：调度入口 vs 运行时控制
+> 📄 调度与资源管理的详细设计见本文件下方的[详细设计章节](#调度与资源管理详细设计)
 
-优化 1/6/7 解决的都是同一个问题的不同维度：**"谁先被调度"（调度入口决策）**。而优化 4 解决的是一个完全不同阶段的问题：**"被调度之后跑多快"（运行时资源消耗控制）**。
+---
 
+### 方向二：KV Cache 管理（5 个优化点）
+
+> **核心思路**：围绕 vLLM V1 的 Prefix Caching 机制做深度优化，提升缓存命中率、降低 TTFT
+
+| # | 优化点 | 优先级 | 状态 | 核心价值 |
+|---|--------|--------|------|---------|
+| 1 | Cache-Aware Scheduling | P0 | ✅ 已实现 | MLFQ 层内按缓存命中率排序，token_budget 利用率↑ |
+| 2 | Frequency-Aware Eviction (Segmented LRU) | P0 | ✅ 已实现 | 高频前缀不被误驱逐，缓存命中率↑ |
+| 3 | Preemption Cache Shield | P0 | ✅ 已实现 | 抢占时保留前缀缓存，恢复代价↓ |
+| 4 | Proactive Cache Warming | P1 | 🔲 未实现 | 冷启动时主动预热高频前缀 |
+| 5 | Cache Efficiency Dashboard | P2 | 🔲 未实现 | 全链路缓存指标可观测 |
+
+**已实现优化的核心设计**：
+
+- **Cache-Aware Scheduling**：调度时优先调度 Prefix Cache 命中率高的请求（`computed_tokens / prompt_tokens`），让命中的请求少做 Prefill 计算，节省 token_budget
+- **Segmented LRU**：将 `FreeKVCacheBlockQueue` 分为 probation 和 protected 两段，高频 block 自动晋升到 protected，不被首次驱逐
+- **Preemption Cache Shield**：抢占时只释放尾部 blocks，保留前缀（System Prompt）缓存，恢复时只需重算尾部
+
+**核心修改文件**：
+- `vllm/v1/core/kv_cache_manager.py` — KV Cache 管理器
+- `vllm/v1/core/kv_cache_utils.py` — 缓存工具函数
+
+> 📄 详细设计文档：[`prefix-cache-scheduling-optimization.md`](prefix-cache-scheduling-optimization.md)
+
+---
+
+### 方向三：投机解码 — 后缀解码（5 个优化点）
+
+> **核心思路**：用后缀树（Suffix Tree）替换 vLLM V1 的 N-gram Proposer，提升 Decode 阶段的投机效率
+
+| # | 优化点 | 优先级 | 状态 | 核心价值 |
+|---|--------|--------|------|---------|
+| 1 | SuffixTreeProposer | P0 | 🔲 设计完成 | 最长后缀匹配，替换固定 N-gram |
+| 2 | 增量后缀自动机 (Incremental SAM) | P0 | 🔲 设计完成 | O(1) 增量更新，避免每步重建 |
+| 3 | 自适应匹配策略 | P1 | 🔲 设计完成 | 动态调整匹配长度和 draft 数量 |
+| 4 | 跨请求共享后缀树 | P2 | 🔲 设计完成 | 利用相似对话模板的跨请求模式 |
+| 5 | 投机解码可观测性 | P2 | 🔲 设计完成 | 全链路指标：接受率、匹配长度、加速比 |
+
+**设计要点**：
+- **后缀解码仅在 Decode 阶段生效**（不影响 Prefill），与 PD 分离天然兼容
+- 当前 vLLM V1 仅支持 N-gram Proposer（固定窗口、无状态搜索、只取首次匹配），后缀树在匹配长度和接受率上显著优于 N-gram
+
+> 📄 详细设计文档：[`suffix-decoding-optimization.md`](suffix-decoding-optimization.md)
+
+---
+
+### 方向四：分布式架构 — PD 分离（6 个优化点）
+
+> **核心思路**：将 Prefill（计算密集）和 Decode（访存密集）分离到不同实例，独立调优 TTFT 和 ITL
+
+| # | 优化点 | 优先级 | 状态 | 核心价值 |
+|---|--------|--------|------|---------|
+| 1 | V1 引擎 PD 基础适配 | P0 | 🔲 设计完成 | V1 的 GPUModelRunner 支持 KV 收发 |
+| 2 | 智能请求路由/代理 | P0 | 🔲 设计完成 | 负载感知 + 请求分类 + 故障转移 |
+| 3 | 调度器 PD 感知 | P1 | 🔲 设计完成 | Prefill-only / Decode-only 专属调度策略 |
+| 4 | KV Cache 传输优化 | P1 | 🔲 设计完成 | 增量传输 + FP8 压缩 + 流水线化 |
+| 5 | Prefix Cache 与 PD 协同 | P2 | 🔲 设计完成 | 跨实例缓存共享，避免重复传输 |
+| 6 | 多实例协调与可观测性 | P2 | 🔲 设计完成 | NP:MD 弹性部署 + 全链路指标 |
+
+**关键背景**：
+- vLLM 已有完整的 PD 分离三层抽象（Pipe → LookupBuffer → Connector），但**仅在 V0 引擎中实现**
+- V1 引擎（`vllm/v1/`）中**零 PD 相关代码**，需要全新适配
+- 现有路由是简单的 HTTP Proxy，无智能决策能力
+
+> 📄 详细设计文档：[`pd-disaggregation-optimization.md`](pd-disaggregation-optimization.md)
+
+---
+
+### 端到端业务场景验证框架
+
+> **核心思路**：设计一个 5 阶段递进加压的综合压测，暴露已有优化的盲区，驱动增量修复
+
+**框架概述**：模拟企业级 AI 平台，一个 vLLM 实例同时服务 7 个租户（Gold/Silver/Bronze），涵盖短对话、代码补全、长文档 RAG 等业务类型。
+
+```
+时间线：
+0s─────60s─────120s─────180s─────240s─────300s
+│ Phase 1 │ Phase 2 │ Phase 3  │ Phase 4  │ Phase 5  │
+│ 稳态预热 │ Prompt  │ Gold-A   │ 长文档   │ 全面     │
+│ 建立基线 │ 版本切换 │ 流量暴增  │ 暴增     │ 过载     │
+```
+
+**暴露的 5 个盲区 → 对应的 5 个增量修复**：
+
+| Phase | 暴露问题 | 增量修复 | 状态 |
+|-------|---------|---------|------|
+| 全程 | 代码补全取消后缓存未保留 | 修复 1：取消感知缓存保留 | 🔲 未实现 |
+| Phase 2 | Prompt 切换时旧缓存占据 protected zone | 修复 2：缓存版本管理 | 🔲 未实现 |
+| Phase 3 | MLFQ/QoS 无租户级隔离 | 修复 3：Prefill 预算隔离 | 🔲 未实现 |
+| Phase 4 | 长文档 Prefill 挤占短对话 budget | 修复 4：租户级资源隔离 | 🔲 未实现 |
+| Phase 5 | 无准入控制和过期丢弃 | 修复 5：过载管理 | 🔲 未实现 |
+
+**文件**：
+- `benchmarks/e2e_business_cases/workload.py` — 压测工作负载生成器 ✅ 已完成
+- `benchmarks/e2e_business_cases/LANDING_PLAN.md` — 分阶段实施方案 ✅ 已完成
+
+> 📄 详细设计文档：[`benchmarks/e2e_business_cases/README.md`](benchmarks/e2e_business_cases/README.md)
+> 📄 落地方案：[`benchmarks/e2e_business_cases/LANDING_PLAN.md`](benchmarks/e2e_business_cases/LANDING_PLAN.md)
+
+---
+
+## 四大方向协同关系
+
+```
+                    ┌────────────────────────────────────────────┐
+                    │       方向一：调度与资源管理                   │
+                    │  QoS 分级 / MLFQ / Token 限速 / 准入控制    │
+                    │  ★ 决定"谁先被调度"+"跑多快"                 │
+                    └──────────────────┬─────────────────────────┘
+                                       │
+                    ┌──────────────────▼─────────────────────────┐
+                    │       方向二：KV Cache 管理                   │
+                    │  Cache-Aware / Segmented LRU / 抢占保护      │
+                    │  ★ 通过前缀复用减少 Prefill 计算量 → TTFT↓   │
+                    └──────────────────┬─────────────────────────┘
+                                       │
+                    ┌──────────────────▼─────────────────────────┐
+                    │       方向三：投机解码（后缀解码）              │
+                    │  SuffixTree / 增量 SAM / 自适应匹配           │
+                    │  ★ Decode 阶段每步有效 token↑ → TPOT↓        │
+                    └──────────────────┬─────────────────────────┘
+                                       │
+                    ┌──────────────────▼─────────────────────────┐
+                    │       方向四：分布式架构（PD 分离）             │
+                    │  V1 适配 / 智能路由 / 传输优化 / Cache 协同   │
+                    │  ★ P/D 独立部署，TTFT 和 ITL 互不干扰        │
+                    └──────────────────┬─────────────────────────┘
+                                       │
+                    ┌──────────────────▼─────────────────────────┐
+                    │      端到端业务场景验证                        │
+                    │  5 阶段递进加压 + 5 项增量修复                 │
+                    │  ★ 从框架优化到业务优化的完整闭环              │
+                    └────────────────────────────────────────────┘
+```
+
+**具体协同**：
+
+| 组合 | 协同效果 |
+|------|---------|
+| 调度 + KV Cache | Cache-Aware 调度优先处理缓存命中高的请求 → Prefill 计算量↓ → token_budget 利用率↑ |
+| 调度 + 投机解码 | MLFQ 对投机解码成功的请求自动保持高优（每步产出多 token → 降级慢） |
+| KV Cache + PD 分离 | Prefix Cache 命中的 KV blocks 不重复传输 → 传输量↓ 50-80% |
+| 投机解码 + PD 分离 | 后缀解码只在 Decode 实例运行 → 不干扰 Prefill 实例的计算密度 |
+| 全部 + 端到端验证 | 综合压测暴露各优化的盲区 → 驱动增量修复 → 形成完整闭环 |
+
+---
+
+## 实现进度总览
+
+### 已实现（6 项）
+
+| # | 优化点 | 方向 | 核心修改文件 |
+|---|--------|------|-------------|
+| 1 | QoS 分级调度 | 调度 | `vllm/v1/core/scheduler.py`, `vllm/v1/request.py` |
+| 2 | Token 级速率控制 | 调度 | `vllm/v1/core/scheduler.py`, `vllm/v1/request.py` |
+| 3 | MLFQ 多级反馈队列 | 调度 | `vllm/v1/core/scheduler.py`, `vllm/v1/request.py` |
+| 4 | Cache-Aware Scheduling | KV Cache | `vllm/v1/core/kv_cache_manager.py` |
+| 5 | Frequency-Aware Eviction (Segmented LRU) | KV Cache | `vllm/v1/core/kv_cache_utils.py` |
+| 6 | Preemption Cache Shield | KV Cache | `vllm/v1/core/kv_cache_manager.py`, `vllm/v1/core/scheduler.py` |
+
+### 设计完成、待实现（18 项）
+
+**调度方向**（5 项）：KV 水位线流控、准入控制、Deadline/EDF、WFQ 公平调度、KV Cache 分层存储
+
+**KV Cache 方向**（2 项）：Proactive Cache Warming、Cache Efficiency Dashboard
+
+**投机解码方向**（5 项）：SuffixTreeProposer、增量 SAM、自适应匹配、跨请求共享、可观测性
+
+**PD 分离方向**（6 项）：V1 适配、智能路由、调度器感知、传输优化、Cache 协同、多实例协调
+
+### 端到端验证框架
+
+- [x] workload.py 工作负载生成器
+- [x] LANDING_PLAN.md 分阶段实施方案
+- [ ] 修复 1：取消感知缓存保留
+- [ ] 修复 2：缓存版本管理
+- [ ] 修复 3：Prefill 预算隔离
+- [ ] 修复 4：租户级资源隔离
+- [ ] 修复 5：过载管理
+
+---
+
+## 预期性能目标
+
+| 指标 | 原生 vLLM V1 | 优化后（预期） | 主要优化来源 |
+|------|-------------|---------------|-------------|
+| 短请求 TTFT P99 | 基准 | ↓ 30-50% | QoS 分级 + Cache-Aware 调度 |
+| 短请求 TPOT 抖动 | 基准 | ↓ 40%+ | Token 限速 + MLFQ |
+| 缓存命中率 | 基准 | ↑ 20-40% | Segmented LRU + Cache-Aware + Preemption Shield |
+| 抢占频率 | 基准 | ↓ 50%+ | 水位线流控 + Token 限速 + 分层存储 |
+| 抢占恢复耗时 | Recompute（秒级） | CPU→GPU memcpy（毫秒级） | KV Cache 分层存储 |
+| Decode 加速比 | 1× (无投机) | 1.5-3× | 后缀解码（SuffixTreeProposer） |
+| ITL 尾延迟（PD 分离） | Prefill 干扰导致尖峰 | 完全稳定 | PD 分离 |
+| 多租户公平性 | 无保障 | Jain's Index > 0.9 | WFQ + 租户隔离 |
+
+---
+
+## 项目亮点
+
+1. **全栈覆盖**：同时优化调度、KV Cache、投机解码、分布式架构四大方向，形成完整的推理优化体系
+2. **技术迁移性强**：将云网络/存储的调度、限速、时延优化、分层存储能力直接复用至推理引擎
+3. **基于 V1 架构**：所有优化直接在 vLLM V1（最新主力架构）上开发，确保前瞻性
+4. **渐进式实现**：24 个优化点按优先级逐步实现，每个独立可用、可测试、可量化
+5. **端到端验证**：5 阶段递进加压的综合压测框架，从框架优化到业务优化的完整闭环
+6. **填补社区空白**：V1 PD 分离、MLFQ、Token 限速、Cache-Aware 调度等均为社区首创
+
+---
+
+## 文档索引
+
+| 文档 | 内容 | 优化点数 |
+|------|------|---------|
+| 📄 本文件 (README.md) | 全局总览 + 调度方向详细设计 | 8 (调度) |
+| 📄 [`prefix-cache-scheduling-optimization.md`](prefix-cache-scheduling-optimization.md) | Prefix Cache 感知调度与复用优化 | 5 (KV Cache) |
+| 📄 [`suffix-decoding-optimization.md`](suffix-decoding-optimization.md) | 后缀解码（投机解码优化） | 5 (投机解码) |
+| 📄 [`pd-disaggregation-optimization.md`](pd-disaggregation-optimization.md) | Prefill-Decode 分离架构优化 | 6 (PD 分离) |
+| 📄 [`benchmarks/e2e_business_cases/README.md`](benchmarks/e2e_business_cases/README.md) | 端到端业务场景综合压测设计 | 5 (增量修复) |
+| 📄 [`benchmarks/e2e_business_cases/LANDING_PLAN.md`](benchmarks/e2e_business_cases/LANDING_PLAN.md) | 端到端压测分阶段实施方案 | — |
+
+---
+
+## 如何运行
+
+### 环境准备
+
+1. GPU 实例（A10/T4/L4 均可），Ubuntu 20.04+，CUDA 12.1+
+2. 安装依赖：
+   ```bash
+   git clone <本项目地址>
+   cd vllm-serving-optimization
+   pip install -e .  # 开发模式安装，改代码实时生效
+   ```
+
+### 启动推理服务
+
+```bash
+python -m vllm.entrypoints.openai.api_server \
+    --model <模型路径> \
+    --max-model-len 4096 \
+    --max-num-batched-tokens 2048 \
+    --enable-chunked-prefill
 ```
 请求的完整生命周期：
 
@@ -581,6 +360,14 @@
 
 优化 1/6/7 解决了"谁先上路"，但一旦请求被选中进入 running 状态，它就以系统最大速度消耗 `token_budget`。这在高负载下会导致问题：
 
+### 运行基准测试
+
+```bash
+# 端到端业务场景综合压测
+python benchmarks/e2e_business_cases/workload.py
+
+# 待实现：对比测试脚本
+python benchmarks/qos_benchmark.py --baseline --optimized --output results/
 ```
 场景：10 个请求在 running 中，全局 token_budget = 2048
 
@@ -589,114 +376,173 @@
   低优请求 × 7: 各消耗 ~200 tokens/step → 合计 1400
   → 低优请求消耗了 68% 的 budget！高优请求的 TPOT 被拖慢
 
-有了优化 4：
-  高优请求 × 3: rate=无限 → 各消耗 ~200 tokens/step → 合计 600
-  低优请求 × 7: rate=50 tokens/step → 各消耗 50 → 合计 350
-  → 剩余 budget 全部留给高优请求，高优 TPOT 稳定
+---
+
+## 调度与资源管理详细设计
+
+> 以下为方向一（调度与资源管理）8 个优化点的详细设计。其他方向的详细设计请参见对应的独立文档。
+
+### 优化 1：推理请求 QoS 分级调度 `[P0]` `[已实现]`
+
+> 对应能力迁移：**云网络虚拟网关 → 优先级队列 + 高优包优先转发**
+
+#### 核心思路
+
+类比网关**高优包优先转发、低时延保障**机制，对推理请求按长度/业务类型分级，保障短对话/搜索类高优请求的低时延体验。
+
+#### vLLM V1 现状分析（v0.7.3）
+
+- V1 调度器（`vllm/v1/core/scheduler.py`）仅支持 FCFS 调度，没有任何优先级机制
+- `Request` 类没有 `priority` 字段，所有请求被平等对待
+- 抢占策略为简单的 LIFO（`self.running.pop()`），不考虑请求重要性
+- **缺少多维优先级计算**：没有综合 prompt 长度分级和等待时间防饿死因子
+
+#### 实现细节
+
+- 修改文件：
+  - `vllm/v1/request.py` — Request 类新增多维优先级计算（`effective_priority` 属性）
+  - `vllm/v1/core/scheduler.py` — 调度器集成动态优先级更新
+- 核心逻辑：
+  1. **多维优先级计算**：综合 API 传入的业务优先级（`priority` 字段）+ `num_prompt_tokens` 长度分级（短请求 <512 token 为高优）+ 等待时间衰减因子（防饿死）；
+  2. **动态优先级更新**：每个调度步开始时，更新所有 waiting 请求的 `effective_priority`，使等待时间越长的请求优先级自动提升；
+  3. **优先级感知调度**：`waiting` 队列每步按 `effective_priority` 重新排序，最高优先级请求排在队首；
+  4. **优先级感知抢占**：抢占时选择 `self.running` 中 `effective_priority` 值最大（优先级最低）的请求。
+
+---
+
+### 优化 2：KV 缓存显存水位线与配额流控 `[P0]` `[未实现]`
+
+> 对应能力迁移：**云存储 IO QoS → 水位线流控 + per-request 带宽配额**
+
+#### 核心思路
+
+借鉴云存储**流量整形、分级水位线、per-request 带宽配额**思想，对 KV 缓存实现显存资源管控。
+
+#### 实现细节
+
+- 修改文件：`vllm/v1/core/kv_cache_manager.py`, `vllm/v1/core/scheduler.py`
+- 核心逻辑：
+  1. **多级水位线**：🟢 绿色（<70%）自由调度 → 🟡 黄色（70-85%）拒绝低优新请求 → 🔴 红色（≥85%）仅允许高优短请求
+  2. **单请求 KV 块动态配额**：`max_blocks_per_req = base_quota × priority_factor × (1 - usage)`
+  3. **主动回收**：水位超过黄色阈值时，主动释放 `ref_cnt == 0` 的 prefix cache blocks
+
+---
+
+### 优化 3：请求准入控制 `[P1]` `[未实现]`
+
+> 对应能力迁移：**网络流量整形 Traffic Shaping → ECN + RED**
+
+#### 实现细节
+
+- 修改文件：`vllm/v1/engine/processor.py`, `vllm/v1/core/kv_cache_manager.py`
+- 核心逻辑：
+  1. **基于 KV Cache 水位的准入**：红色水位仅放行高优请求
+  2. **基于队列深度的准入**：`len(waiting) > MAX_QUEUE_DEPTH` 时返回 503 + Retry-After
+  3. **拒绝策略**：返回明确错误码和重试建议（类比 ECN 通知上游降速）
+
+---
+
+### 优化 4：Token 级速率控制 `[P1]` `[已实现]`
+
+> 对应能力迁移：**云存储 IO 限速 → 令牌桶（Token Bucket）/ 漏桶（Leaky Bucket）**
+
+#### 实现细节
+
+- 修改文件：`vllm/v1/core/scheduler.py`, `vllm/v1/request.py`
+- 核心逻辑：
+  1. **Per-request 令牌桶**：`TokenRateLimiter(rate, burst, tokens)`
+  2. **差异化限速**：高优不限速，低优根据系统负载动态调整 rate（8-64 tokens/step）
+  3. **集成到调度器**：`schedule()` 中 `num_new_tokens = rate_limiter.consume(num_new_tokens)`
+
+---
+
+### 优化 5：Deadline-aware 调度 `[P2]` `[未实现]`
+
+> 对应能力迁移：**网络 QoS Deadline 队列 → fq_codel / HFSC 调度**
+
+#### 实现细节
+
+- 修改文件：`vllm/v1/request.py`, `vllm/v1/core/scheduler.py`, `vllm/v1/engine/processor.py`
+- 核心逻辑：
+  1. **EDF（Earliest Deadline First）调度**：deadline 最早的请求最先被调度
+  2. **松弛时间感知**：`slack_time = deadline - now - estimated_remaining_time`
+  3. **超时处理**：超过 deadline 未开始 → 408 Timeout；已在生成中 → 标记低优
+
+---
+
+### 优化 6：加权公平队列 WFQ 调度 `[P2]` `[未实现]`
+
+> 对应能力迁移：**网络 WFQ/DRR 流量调度 → 多租户加权公平**
+
+#### 实现细节
+
+- 修改文件：`vllm/v1/core/scheduler.py`, 新增 `vllm/v1/core/tenant_manager.py`
+- 核心逻辑：
+  1. **WFQ 虚拟时间戳调度**：选 `virtual_time` 最小的租户的队首请求
+  2. **租户级 Token Budget 池化**：全局 budget 按权重划分给各租户
+  3. **Budget 借用机制**：空闲租户的 budget 可被借用（work-conserving）
+
+---
+
+### 优化 7：MLFQ 多级反馈队列 `[P3]` `[已实现]`
+
+> 对应能力迁移：**OS 进程调度 CFS → 多级反馈 + 自适应优先级**
+
+#### 实现细节
+
+- 修改文件：`vllm/v1/request.py`, `vllm/v1/core/scheduler.py`
+- 核心逻辑：
+  1. **4 级队列**：L0(interactive, 128) → L1(standard, 512) → L2(batch, 2048) → L3(background, ∞)
+  2. **降级规则**：累计消耗 token 超过当前级配额 → 自动降级（`mlfq_account_tokens()`）
+  3. **升级规则**：被抢占 → 升一级（`mlfq_promote()`），token 消耗不重置
+  4. **调度顺序**：从 L0 扫描，有请求则优先调度，级别内 FCFS
+
+---
+
+### 优化 8：KV Cache 分层存储与智能迁移 `[P1]` `[未实现]`
+
+> 对应能力迁移：**存储系统热温冷分层 + 块迁移 + 预取**
+
+#### 实现细节
+
+- 新增/修改文件：`vllm/v1/core/kv_cache_manager.py`, `vllm/v1/core/kv_cache_utils.py`, 新增 `vllm/v1/core/block_migrator.py`
+- 核心逻辑：
+  1. **三级分层**：L1 GPU 显存（热）→ L2 CPU DRAM（温）→ L3 NVMe SSD（冷）
+  2. **块级粒度迁移**：CUDA 异步 memcpy（不阻塞 GPU 计算），对比 V0 的全量 swap
+  3. **智能降级**：高优请求只降到 CPU（保证快速恢复），低优可降到磁盘
+  4. **智能预取**：预测下一步可能调度的 top-K 请求，异步预取其 KV Cache
+  5. **抢占改造**：抢占不再 Recompute，而是降级到 CPU 保存
+
+```
+改造后（三级分层）：
+
+  ┌───────────────────────────┐
+  │   L1: GPU 显存（热层）      │  ← 活跃请求的 KV Cache
+  ├───────────────────────────┤
+  │   L2: CPU DRAM（温层）      │  ← 被抢占请求的 KV Cache（保留，不丢弃）
+  ├───────────────────────────┤
+  │   L3: NVMe SSD（冷层）      │  ← 长上下文历史 KV Cache
+  └───────────────────────────┘
 ```
 
-**优化 4 的核心价值**：不是把低优请求踢出去（抢占代价太高），而是**让它慢慢跑**，把计算资源让给高优请求。这比抢占（Recompute）要优雅得多：
+---
 
-| 策略 | 对低优请求的影响 | 代价 |
-|------|---------------|------|
-| 抢占（优化 1 的极端情况） | 被踢出 running，KV Cache 全部丢失，需从头重算 | 极高（Recompute） |
-| 限速（优化 4） | 留在 running 中，只是跑慢一点 | 几乎为零 |
-
-**四者协同的完整调度架构**：
+## 优化点依赖关系
 
 ```
-请求到达
-    │
-    ▼
-优化 6（WFQ）：按 tenant_id 分流 → 保证租户间公平
-    │
-    ▼
-优化 1（QoS）：同一租户内按 effective_priority 排序
-    │
-    ▼
-优化 7（MLFQ）：同优先级内自适应排序
-    │
-    ▼
-请求被选中，进入 running 状态
-    │
-    ▼
-优化 4（Token 限速）：低优请求限速，为高优让出 token_budget
-    │
-    ▼
-输出 tokens
+方向一（调度）:
+  优化 1 (QoS) ──┬──→ 优化 3 (准入控制) ──→ 优化 5 (Deadline/EDF)
+  优化 2 (水位线) ─┤         │
+  优化 8 (分层) ───┘         ├──→ 优化 4 (Token 限速)
+                    优化 6 (WFQ) ──→ 优化 7 (MLFQ)
+
+方向四（PD 分离）:
+  优化 1 (V1 适配) ──┬──→ 优化 2 (路由) ──→ 优化 6 (多实例)
+                     ├──→ 优化 3 (调度感知)
+                     └──→ 优化 4 (传输) ──→ 优化 5 (Cache 协同)
+
+跨方向:
+  调度·QoS + KV Cache·Cache-Aware → 缓存命中优先调度
+  KV Cache·Segmented LRU + PD·传输优化 → 缓存命中部分不传输
+  投机解码 + PD·Decode-only → 投机解码不干扰 Prefill
 ```
-
-| 优化点 | 优先级 | 状态 | 核心修改文件 | Infra 能力对标 |
-|--------|--------|------|-------------|---------------|
-| 1. QoS 分级调度 | P0 | ✅ 已实现 | `vllm/v1/core/sched/scheduler.py`, `vllm/v1/request.py` | 网关优先级队列 |
-| 2. KV 水位线流控 | P0 | 🔲 未实现 | `vllm/v1/core/kv_cache_manager.py`, `vllm/v1/core/scheduler.py` | 存储水位线 + IO 配额 |
-| 3. 准入控制 | P1 | 🔲 未实现 | `vllm/v1/engine/processor.py`, `vllm/v1/core/kv_cache_manager.py` | ECN + RED 拥塞控制 |
-| 4. Token 限速 | P1 | 🔲 未实现 | `vllm/v1/core/scheduler.py`, `vllm/v1/request.py` | 令牌桶 / 漏桶限速 |
-| 5. Deadline/EDF 调度 | P2 | 🔲 未实现 | `vllm/v1/request.py`, `vllm/v1/core/scheduler.py`, `vllm/v1/engine/processor.py` | EDF + fq_codel / HFSC |
-| 6. WFQ 公平调度 | P2 | 🔲 未实现 | `vllm/v1/core/scheduler.py`, `vllm/v1/request.py`, 新增 `vllm/v1/core/tenant_manager.py` | WFQ / DRR + per-tenant 配额 |
-| 7. MLFQ 多级反馈 | P3 | 🔲 未实现 | `vllm/v1/core/scheduler.py`, `vllm/v1/request.py` | OS MLFQ / CFS |
-| 8. KV Cache 分层存储 | P1 | 🔲 未实现 | `vllm/v1/core/kv_cache_manager.py`, `vllm/v1/core/kv_cache_utils.py`, 新增 `vllm/v1/core/block_migrator.py` | 存储热温冷分层 + 预取 |
-
-## 项目亮点
-
-1. **技术迁移性强**：将云网络/存储的调度、限速、时延优化、分层存储能力直接复用至推理引擎，非纯 AI 调参，具备工程落地价值；
-2. **基于 V1 架构**：V1 是 vLLM 的最新主力架构（多进程 ZMQ IPC），所有优化直接在 V1 上开发，确保前瞻性；
-3. **渐进式实现**：8 个优化点从 P0 到 P3 逐步实现，每个独立可用、可测试、可量化；
-4. **填补社区空白**：KV Cache 分层存储、Deadline/EDF 调度、Token 限速、MLFQ 等机制在 vLLM V1 社区均无人实现，差异化明显；
-5. **两大核心方向**：调度器优化（优化 1/3/4/5/6/7）+ KV Cache 存储优化（优化 2/8），覆盖推理引擎两大核心子系统；
-6. **贴近线上场景**：解决的都是推理引擎上线的真实痛点（时延抖动、OOM、资源抢占、长上下文支撑），而非玩具项目。
-
-## 性能测试对比
-
-> ⚠️ 以下为预期性能目标，待各优化点实现后逐步补充实测数据。
-
-| 指标 | 原生 vLLM V1 | 优化后（预期） | 优化来源 |
-|------|-------------|---------------|----------|
-| 短请求 TTFT P99 | 基准 | ↓ 30-50% | 优化 1 + 优化 5 |
-| 短请求 TPOT 抖动 | 基准 | ↓ 40%+ | 优化 4 + 优化 2 |
-| 最大显存占用 | 基准 | ↓ 20-30% | 优化 2 + 优化 3 |
-| 长请求 OOM 概率 | 存在 | → 0% | 优化 2 + 优化 3 + 优化 8 |
-| 抢占频率 | 基准 | ↓ 50%+ | 优化 2 + 优化 4 + 优化 8 |
-| 抢占恢复耗时 | Recompute（秒级） | CPU→GPU memcpy（毫秒级） | 优化 8 |
-| 长上下文支撑（128K+） | 单卡易 OOM | 三级分层，稳定运行 | 优化 8 |
-| 多租户公平性 | 无保障 | Jain's Index > 0.9 | 优化 6 |
-
-## 如何运行
-
-### 环境准备
-
-1. GPU 实例（A10/T4/L4 均可），Ubuntu 20.04+，CUDA 12.1+；
-2. 安装依赖：
-   ```bash
-   git clone https://github.com/你的用户名/vllm-inference-qos-latency-optimization.git
-   cd vllm-inference-qos-latency-optimization
-   pip install -e .  # 开发模式安装，改代码实时生效
-   ```
-
-### 启动推理服务
-
-```bash
-python -m vllm.entrypoints.openai.api_server \
-    --model <模型路径> \
-    --max-model-len 4096 \
-    --max-num-batched-tokens 2048 \
-    --enable-chunked-prefill
-```
-
-### 运行基准测试
-
-```bash
-# 待实现：对比测试脚本
-python benchmarks/qos_benchmark.py --baseline --optimized --output results/
-```
-
-## 实现进度追踪
-
-- [x] 优化 1：QoS 分级调度（P0）
-- [ ] 优化 2：KV 缓存水位线流控（P0）
-- [ ] 优化 8：KV Cache 分层存储与智能迁移（P1）
-- [ ] 优化 3：请求准入控制（P1）
-- [ ] 优化 4：Token 级速率控制（P1）
-- [ ] 优化 5：Deadline/EDF 调度（P2）
-- [ ] 优化 6：WFQ 加权公平调度（P2）
-- [ ] 优化 7：MLFQ 多级反馈队列（P3）
