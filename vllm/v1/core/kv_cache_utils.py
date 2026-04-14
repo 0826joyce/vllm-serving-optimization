@@ -408,6 +408,47 @@ class FreeKVCacheBlockQueue:
         else:
             self._num_protected -= 1
 
+    # ------------------------------------------------------------------
+    # Cache version management: dynamic protected zone resizing
+    # ------------------------------------------------------------------
+
+    def resize_protected(self, new_ratio: float) -> None:
+        """Dynamically resize the protected zone.
+
+        When a prompt version switch is detected (hit-rate drop), the
+        caller shrinks the protected zone so that stale blocks are
+        demoted to probation and evicted faster.  When hit-rate recovers,
+        the caller restores the original ratio.
+
+        Excess protected blocks are demoted to the **head** of the
+        probation zone so they become the next eviction candidates.
+
+        Args:
+            new_ratio: New protected-zone ratio (0.0–1.0) relative to
+                the total number of blocks that *can* be in the free
+                queue (i.e. ``num_gpu_blocks`` that the queue was
+                originally built with, approximated here by the current
+                free count + current max_protected as a baseline).
+        """
+        # Use the current total free blocks to compute the new cap.
+        total_free = self._num_probation + self._num_protected
+        if total_free == 0:
+            # Nothing in the free queue; just update the cap.
+            self._max_protected = 0
+            return
+
+        new_max_protected = max(int(total_free * new_ratio), 0)
+
+        # Demote excess protected blocks to probation head.
+        while self._num_protected > new_max_protected:
+            demoted = self._protected_head
+            if demoted is None:
+                break
+            self._remove_from_zone(demoted, "protected")
+            self._prepend_to_zone(demoted, "probation")
+
+        self._max_protected = new_max_protected
+
 
 def need_extra_keys(request: Request) -> bool:
     """Check whether the blocks allocated to this request need extra hash keys.
