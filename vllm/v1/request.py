@@ -161,6 +161,7 @@ class Request:
         arrival_time: float,
         lora_request: Optional[LoRARequest] = None,
         priority: int = 0,
+        tenant_id: str = "default",
     ) -> None:
         self.request_id = request_id
         self.sampling_params = sampling_params
@@ -168,6 +169,8 @@ class Request:
         self.eos_token_id = eos_token_id
         self.arrival_time = arrival_time
         self.lora_request = lora_request
+        # ---- Tenant isolation (Phase 3) ----
+        self.tenant_id = tenant_id
 
         self.status = RequestStatus.WAITING
         self.events: List[EngineCoreEvent] = []
@@ -326,6 +329,7 @@ class Request:
             eos_token_id=request.eos_token_id,
             arrival_time=request.arrival_time,
             lora_request=request.lora_request,
+            tenant_id=getattr(request, 'tenant_id', 'default'),
         )
 
     def queued(self, timestamp: Optional[float] = None) -> None:

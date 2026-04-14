@@ -16,6 +16,7 @@ from vllm.v1.core.encoder_cache_manager import (EncoderCacheManager,
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.scheduler_output import (CachedRequestData, NewRequestData,
                                            SchedulerOutput)
+from vllm.v1.core.tenant_manager import TenantManager
 from vllm.v1.engine import (EngineCoreEvent, EngineCoreEventType,
                             EngineCoreOutput, EngineCoreOutputs)
 from vllm.v1.metrics.stats import SchedulerStats
@@ -240,6 +241,16 @@ class Scheduler:
         self.long_prefill_threshold: int = 1024  # tokens
         self.short_budget_reserve_ratio: float = 0.3  # 30% for short reqs
         self.max_concurrent_long_prefill: int = 2
+
+        # ---- Tenant-Level Resource Isolation (Phase 3 fix) ----
+        # Prevents a single large tenant (e.g. Gold-A bursting 4x) from
+        # starving other tenants (Silver) by enforcing per-tenant concurrency
+        # caps and weighted fair scheduling (WFQ).
+        self.tenant_manager = TenantManager(
+            default_max_running=max(1, self.max_num_running_reqs // 2),
+            default_weight=1.0,
+        )
+        self.enable_tenant_isolation: bool = True
 
         # ---- Preemption Cache Shield ----
         # Minimum number of blocks that a partial free must release.
@@ -497,6 +508,11 @@ class Scheduler:
             short_budget_reserved = int(
                 token_budget * self.short_budget_reserve_ratio)
 
+            # ---- Tenant Isolation: per-step state ----
+            # Track tenants that have reached their concurrency cap so we
+            # can skip their requests without breaking the loop.
+            tenants_at_cap: Set[str] = set()
+
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
@@ -536,6 +552,29 @@ class Scheduler:
                     # and we don't want to skip ahead (FCFS guarantee
                     # within each MLFQ level).
                     break
+
+                # ---- Tenant Isolation: concurrency cap check ----
+                # If the tenant has reached its max_running limit, skip
+                # this request and try other tenants' requests.
+                if (self.enable_tenant_isolation
+                        and not self.tenant_manager.can_schedule(
+                            request.tenant_id)):
+                    tenants_at_cap.add(request.tenant_id)
+                    # Remove from current position and re-append to tail
+                    # of the same MLFQ level so we try other requests.
+                    if self.enable_mlfq:
+                        self.mlfq_queues[request.mlfq_level].remove(request)
+                        self.mlfq_queues[request.mlfq_level].append(request)
+                    else:
+                        self.waiting.remove(request)
+                        self.waiting.append(request)
+                    # Check if ALL remaining waiting requests are from
+                    # capped tenants — if so, stop to avoid infinite loop.
+                    all_capped = all(
+                        r.tenant_id in tenants_at_cap for r in self.waiting)
+                    if all_capped:
+                        break
+                    continue
 
                 # Check that adding the request still respects the max_loras
                 # constraint.
@@ -638,6 +677,11 @@ class Scheduler:
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+
+                # ---- Tenant Isolation: update running count ----
+                if self.enable_tenant_isolation:
+                    self.tenant_manager.on_request_scheduled(
+                        request.tenant_id)
 
                 # Encoder-related.
                 if encoder_inputs_to_schedule:
@@ -1014,6 +1058,9 @@ class Scheduler:
         self.kv_cache_manager.free_block_hashes(request)
         self.encoder_cache_manager.free(request)
         self._cached_reqs_data.pop(request.request_id, None)
+        # ---- Tenant Isolation: decrement running count ----
+        if self.enable_tenant_isolation:
+            self.tenant_manager.on_request_finished(request.tenant_id)
         # ---- PD-Aware: Cleanup KV receive tracking ----
         if self.kv_receive_monitor is not None:
             self.kv_receive_monitor.remove(request.request_id)
