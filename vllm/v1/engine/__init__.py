@@ -60,6 +60,7 @@ class EngineCoreRequest(
     arrival_time: float
     lora_request: Optional[LoRARequest]
     tenant_id: str = "default"
+    sla_ttft_ms: float = float('inf')
 
 
 class EngineCoreEventType(enum.IntEnum):
