@@ -2,11 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import enum
+import math
 import time
-from collections import deque
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import torch
 
@@ -55,30 +53,161 @@ class StreamingUpdate:
         )
 
 
+# ---- Token Rate Limiter (Token Bucket) ----
+# Per-request token generation rate control.  High-priority requests are
+# not rate-limited; low-priority requests are throttled so that compute
+# resources (token_budget) are freed for high-priority requests.
+# This is analogous to IO QoS token-bucket / leaky-bucket rate limiting
+# in cloud storage systems.
+
+class TokenRateLimiter:
+    """Per-request token bucket rate limiter.
+
+    Each request carries its own token bucket.  The bucket is refilled at
+    ``rate`` tokens per scheduling step.  ``burst`` controls the maximum
+    number of tokens that can accumulate (for bursty generation).
+
+    A rate of ``math.inf`` means *no limit* (high-priority / idle system).
+    """
+
+    # Default rates per priority tier.  These are overridden by the
+    # scheduler based on system load.
+    #   HIGH  -> unlimited (no throttle)
+    #   NORMAL -> moderate limit under load
+    #   LOW   -> aggressive limit under load
+    DEFAULT_RATE_HIGH: float = math.inf
+    DEFAULT_RATE_NORMAL: float = 64.0   # tokens per step
+    DEFAULT_RATE_LOW: float = 16.0      # tokens per step
+    DEFAULT_BURST: int = 128            # max burst capacity
+
+    # Load thresholds: when the fraction of running requests relative to
+    # max_num_running_reqs exceeds these thresholds, rate limiting kicks in.
+    LOAD_THRESHOLD_MODERATE: float = 0.5   # 50% → start limiting low-prio
+    LOAD_THRESHOLD_HIGH: float = 0.8       # 80% → aggressive limiting
+
+    def __init__(
+        self,
+        rate: float = math.inf,
+        burst: int = 128,
+    ) -> None:
+        self.rate = rate      # tokens replenished per step
+        self.burst = burst    # maximum bucket capacity
+        self.tokens = float(burst)  # current available tokens
+
+    def refill(self) -> None:
+        """Refill the bucket (called once per scheduling step)."""
+        if self.rate == math.inf:
+            self.tokens = float(self.burst)
+        else:
+            self.tokens = min(self.tokens + self.rate, float(self.burst))
+
+    def consume(self, requested: int) -> int:
+        """Try to consume ``requested`` tokens.
+
+        Returns the number of tokens actually allowed (may be less than
+        ``requested`` if the bucket is drained).
+        """
+        if self.rate == math.inf:
+            return requested
+        allowed = min(requested, max(0, int(self.tokens)))
+        self.tokens -= allowed
+        return allowed
+
+    def available(self) -> int:
+        """Return the number of tokens currently available."""
+        if self.rate == math.inf:
+            return 2**31  # effectively unlimited
+        return max(0, int(self.tokens))
+
+    def set_rate(self, rate: float, burst: Optional[int] = None) -> None:
+        """Dynamically adjust the rate and optionally the burst size."""
+        self.rate = rate
+        if burst is not None:
+            self.burst = burst
+
+    def is_limited(self) -> bool:
+        """Return True if this limiter imposes any restriction."""
+        return self.rate != math.inf
+
+
+# ---- MLFQ Level Configuration ----
+# Multi-Level Feedback Queue: requests start at the highest priority level
+# (L0) and are demoted to lower levels as they consume more token budget.
+# Short requests naturally finish at high levels; long requests gradually
+# sink to lower levels — no explicit priority annotation needed.
+
+class MLFQLevel:
+    """Configuration for a single MLFQ level."""
+
+    def __init__(self, level: int, name: str, token_quota: float):
+        self.level = level
+        self.name = name
+        # Max cumulative tokens a request can consume at this level
+        # before being demoted to the next level.
+        self.token_quota = token_quota
+
+    def __repr__(self) -> str:
+        return f"MLFQLevel(L{self.level}, {self.name}, quota={self.token_quota})"
+
+
+# Default MLFQ level definitions.
+# token_quota is the cumulative token budget threshold for demotion.
+MLFQ_LEVELS: List[MLFQLevel] = [
+    MLFQLevel(level=0, name="interactive", token_quota=128),
+    MLFQLevel(level=1, name="standard", token_quota=512),
+    MLFQLevel(level=2, name="batch", token_quota=2048),
+    MLFQLevel(level=3, name="background", token_quota=math.inf),
+]
+
+# Number of MLFQ levels.
+MLFQ_NUM_LEVELS: int = len(MLFQ_LEVELS)
+
+
 class Request:
+
+    # ---- QoS Priority Configuration ----
+    # Prompt length thresholds for automatic priority boosting.
+    # Requests shorter than SHORT_PROMPT_THRESHOLD get a priority boost
+    # (lower effective_priority value = higher scheduling priority).
+    SHORT_PROMPT_THRESHOLD: int = 512      # tokens
+    MEDIUM_PROMPT_THRESHOLD: int = 2048    # tokens
+
+    # Priority boost values applied based on prompt length.
+    # These are *subtracted* from the base priority, so a positive boost
+    # means higher scheduling priority (smaller effective_priority).
+    SHORT_PROMPT_BOOST: int = 2    # short requests get significant boost
+    MEDIUM_PROMPT_BOOST: int = 1   # medium requests get moderate boost
+    LONG_PROMPT_PENALTY: int = 1   # long requests get slight penalty
+
+    # Anti-starvation: how fast waiting time decays priority.
+    # Every STARVATION_DECAY_INTERVAL seconds of waiting reduces
+    # effective_priority by 1 (i.e., raises scheduling priority).
+    STARVATION_DECAY_INTERVAL: float = 5.0   # seconds
+    MAX_STARVATION_BOOST: int = 10           # cap on starvation boost
+
     def __init__(
         self,
         request_id: str,
-        prompt_token_ids: list[int] | None,
-        sampling_params: SamplingParams | None,
-        pooling_params: PoolingParams | None,
-        client_index: int = 0,
-        arrival_time: float | None = None,
-        prompt_embeds: torch.Tensor | None = None,
-        mm_features: list[MultiModalFeatureSpec] | None = None,
-        lora_request: "LoRARequest | None" = None,
-        cache_salt: str | None = None,
+        prompt: Optional[str],
+        prompt_token_ids: List[int],
+        multi_modal_inputs: Optional[List["MultiModalKwargs"]],
+        multi_modal_hashes: Optional[List[str]],
+        multi_modal_placeholders: Optional[List["PlaceholderRange"]],
+        sampling_params: SamplingParams,
+        eos_token_id: Optional[int],
+        arrival_time: float,
+        lora_request: Optional[LoRARequest] = None,
         priority: int = 0,
-        trace_headers: Mapping[str, str] | None = None,
-        block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
-        resumable: bool = False,
-        reasoning_ended: bool | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
         self.priority = priority
+        # QoS: cached effective priority (updated by scheduler each step)
+        self._effective_priority: int | None = None
         self.sampling_params = sampling_params
-        self.pooling_params = pooling_params
+        # Because of LoRA, the eos token id can be different for each request.
+        self.eos_token_id = eos_token_id
+        self.arrival_time = arrival_time
         self.lora_request = lora_request
         self.structured_output_request = StructuredOutputRequest.from_sampling_params(
             sampling_params
@@ -175,6 +304,120 @@ class Request:
         self.resumable = resumable
         # None entry in the queue means finished.
         self.streaming_queue: deque[StreamingUpdate | None] | None = None
+
+        # ---- QoS Priority Fields ----
+        # Base priority from API caller (lower value = higher priority).
+        self.priority = priority
+        # Effective priority computed by multi-dimensional formula.
+        # Updated dynamically each scheduling step.
+        self._effective_priority: float = float(priority)
+
+        # ---- Token Rate Limiter Fields ----
+        # Per-request token bucket for rate-limiting token generation.
+        # High-priority requests get unlimited rate; low-priority requests
+        # are throttled under load to free token_budget for high-priority ones.
+        self.rate_limiter: TokenRateLimiter = TokenRateLimiter()
+
+        # ---- MLFQ (Multi-Level Feedback Queue) Fields ----
+        # Current MLFQ level (0 = highest priority, MLFQ_NUM_LEVELS-1 = lowest).
+        self.mlfq_level: int = 0
+        # Cumulative output tokens generated so far for MLFQ accounting.
+        # This tracks the "CPU time" consumed by the request, used to
+        # decide when to demote to a lower level.
+        self.mlfq_tokens_consumed: int = 0
+
+    # ---- QoS Priority Methods ----
+
+    @property
+    def effective_priority(self) -> float:
+        """Return the last computed effective priority.
+
+        Lower value = higher scheduling priority.
+        """
+        return self._effective_priority
+
+    def compute_effective_priority(self,
+                                   now: Optional[float] = None) -> float:
+        """Compute multi-dimensional effective priority.
+
+        Formula:
+            effective_priority = base_priority
+                                 + length_adjustment
+                                 - starvation_boost
+
+        Where:
+        - base_priority: API-provided static priority (default 0)
+        - length_adjustment: automatic boost based on prompt token count
+          (short prompts get negative adjustment = higher priority)
+        - starvation_boost: increases over time to prevent starvation
+          (subtracted, so longer wait = higher priority)
+        """
+        if now is None:
+            now = time.time()
+
+        base = self.priority
+
+        # Length-based adjustment
+        if self.num_prompt_tokens < self.SHORT_PROMPT_THRESHOLD:
+            length_adjustment = -self.SHORT_PROMPT_BOOST
+        elif self.num_prompt_tokens < self.MEDIUM_PROMPT_THRESHOLD:
+            length_adjustment = -self.MEDIUM_PROMPT_BOOST
+        else:
+            length_adjustment = self.LONG_PROMPT_PENALTY
+
+        # Anti-starvation boost based on waiting time
+        waiting_time = max(0.0, now - self.arrival_time)
+        starvation_boost = min(
+            int(waiting_time / self.STARVATION_DECAY_INTERVAL),
+            self.MAX_STARVATION_BOOST,
+        )
+
+        # Combine: lower value = higher priority
+        self._effective_priority = base + length_adjustment - starvation_boost
+        return self._effective_priority
+
+    # ---- MLFQ Methods ----
+
+    def mlfq_account_tokens(self, num_tokens: int) -> None:
+        """Account for tokens consumed by this request in the MLFQ.
+
+        Called after each scheduling step with the number of *output* tokens
+        generated.  When the cumulative consumption exceeds the current
+        level's quota the request is automatically demoted.
+        """
+        self.mlfq_tokens_consumed += num_tokens
+        # Check if demotion is needed.
+        current_level = MLFQ_LEVELS[self.mlfq_level]
+        if (self.mlfq_tokens_consumed >= current_level.token_quota
+                and self.mlfq_level < MLFQ_NUM_LEVELS - 1):
+            self.mlfq_level += 1
+
+    def mlfq_promote(self) -> None:
+        """Promote the request by one MLFQ level (anti-starvation).
+
+        Called when a request is preempted — it gets promoted one level
+        (but not beyond L0) so that it receives slightly better treatment
+        when re-scheduled.  The token consumption counter is **not** reset
+        so that the request cannot game the system by being repeatedly
+        preempted.
+        """
+        if self.mlfq_level > 0:
+            self.mlfq_level -= 1
+
+    def __lt__(self, other: "Request") -> bool:
+        """Compare two requests for priority scheduling.
+
+        Uses effective_priority (multi-dimensional) if computed,
+        otherwise falls back to arrival_time (FCFS).
+        Lower effective_priority = higher scheduling priority.
+        """
+        self_prio = self.effective_priority
+        other_prio = other.effective_priority
+        if self_prio != other_prio:
+            return self_prio < other_prio
+        if self.arrival_time != other.arrival_time:
+            return self.arrival_time < other.arrival_time
+        return self.request_id < other.request_id
 
     @classmethod
     def from_engine_core_request(
@@ -278,13 +521,78 @@ class Request:
         events, self.events = self.events, []
         return events
 
+    @property
+    def effective_priority(self) -> int:
+        """Get the effective priority for scheduling decisions.
+
+        This is the multi-dimensional priority that combines:
+        1. API-provided base priority
+        2. Prompt length-based boost (short requests get higher priority)
+        3. Waiting time anti-starvation decay
+
+        Lower value = higher scheduling priority.
+        If not yet computed, falls back to static priority.
+        """
+        if self._effective_priority is not None:
+            return self._effective_priority
+        return self.priority
+
+    def compute_effective_priority(self, now: float | None = None) -> int:
+        """Compute and cache the multi-dimensional effective priority.
+
+        This method should be called by the scheduler at the beginning of
+        each scheduling step for all waiting requests.
+
+        Args:
+            now: Current time (monotonic). If None, uses time.time().
+
+        Returns:
+            The computed effective priority value.
+            Lower value = higher scheduling priority.
+        """
+        if now is None:
+            now = time.time()
+
+        # Start with API-provided base priority.
+        # Lower priority value = higher scheduling priority.
+        base = self.priority
+
+        # 1. Prompt length-based boost:
+        #    Short prompts (<512 tokens) get priority boost (subtracted).
+        #    Long prompts (>2048 tokens) get slight penalty (added).
+        num_prompt = self.num_prompt_tokens
+        if num_prompt < self.SHORT_PROMPT_THRESHOLD:
+            length_adjustment = -self.SHORT_PROMPT_BOOST
+        elif num_prompt < self.MEDIUM_PROMPT_THRESHOLD:
+            length_adjustment = -self.MEDIUM_PROMPT_BOOST
+        else:
+            length_adjustment = self.LONG_PROMPT_PENALTY
+
+        # 2. Anti-starvation waiting time decay:
+        #    Every STARVATION_DECAY_INTERVAL seconds of waiting reduces
+        #    effective priority by 1 (capped at MAX_STARVATION_BOOST).
+        waiting_time = now - self.arrival_time
+        starvation_boost = min(
+            int(waiting_time / self.STARVATION_DECAY_INTERVAL),
+            self.MAX_STARVATION_BOOST,
+        )
+
+        # Combine: lower value = higher priority
+        self._effective_priority = base + length_adjustment - starvation_boost
+        return self._effective_priority
+
     def __lt__(self, other: "Request") -> bool:
         """
-        Compare two requests based on priority, arrival time, and request ID.
-        Used in priority scheduling.
+        Compare two requests based on effective priority, arrival time,
+        and request ID. Used in priority scheduling.
+
+        Uses effective_priority (multi-dimensional) if computed,
+        otherwise falls back to static priority.
         """
-        if self.priority != other.priority:
-            return self.priority < other.priority
+        self_prio = self.effective_priority
+        other_prio = other.effective_priority
+        if self_prio != other_prio:
+            return self_prio < other_prio
         if self.arrival_time != other.arrival_time:
             return self.arrival_time < other.arrival_time
         if self.request_id != other.request_id:
