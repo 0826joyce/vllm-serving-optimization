@@ -583,6 +583,8 @@ class RequestStatus(enum.IntEnum):
     FINISHED_IGNORED = enum.auto()
     FINISHED_ERROR = enum.auto()
     FINISHED_REPETITION = enum.auto()
+    # Rejected by admission control (overload management).
+    FINISHED_REJECTED = enum.auto()
 
     def __str__(self) -> str:
         return self.name

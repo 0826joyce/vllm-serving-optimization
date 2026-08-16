@@ -471,6 +471,16 @@ class Scheduler(SchedulerInterface):
         if self.policy == SchedulingPolicy.PRIORITY:
             self._update_effective_priorities()
 
+        # Token Rate Limiting: update per-request token buckets based on
+        # current system load (disabled via VLLM_DISABLE_RATE_LIMIT=1).
+        if self.enable_token_rate_limiting:
+            self._update_rate_limiters()
+
+        # Deadline-aware scheduling: boost urgent requests within each
+        # MLFQ level (disabled via VLLM_DISABLE_DEADLINE_AWARE=1).
+        if self.enable_deadline_aware_scheduling:
+            self._deadline_aware_sort_waiting()
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -668,6 +678,16 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                # ---- Tenant-level isolation: concurrency cap ----
+                # Skip requests whose tenant has reached its max_running
+                # concurrency limit (VLLM_DISABLE_TENANT_ISO=1 disables).
+                if self.enable_tenant_isolation and not self.tenant_manager.can_schedule(
+                    request.tenant_id
+                ):
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -1529,6 +1549,12 @@ class Scheduler(SchedulerInterface):
             kv_transfer_params = None
             status_before_stop = request.status
 
+            # ---- MLFQ: account for generated tokens (demotion) ----
+            # Long requests gradually sink to lower MLFQ levels as they
+            # consume more tokens (VLLM_DISABLE_MLFQ=1 disables this).
+            if self.enable_mlfq and generated_token_ids:
+                request.mlfq_account_tokens(len(generated_token_ids))
+
             # Check for stop and update request status.
             if new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(
@@ -1881,6 +1907,16 @@ class Scheduler(SchedulerInterface):
                 # Streaming-input session finished.
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         else:
+            # ---- Overload Management: Admission Control ----
+            # Under overload, reject low-priority requests to protect
+            # high-priority ones' SLA (VLLM_DISABLE_OVERLOAD_MGMT=1
+            # disables this).
+            if self.enable_overload_management and not self._should_admit(
+                request
+            ):
+                request.status = RequestStatus.FINISHED_REJECTED
+                self.requests[request.request_id] = request
+                return
             if request.resumable:
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
