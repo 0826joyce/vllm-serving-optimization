@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import math
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -51,13 +53,20 @@ from vllm.v1.core.sched.request_queue import (
     SchedulingPolicy,
     create_request_queue,
 )
+from vllm.v1.core.sched.tenant_manager import TenantManager
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
-from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.request import (
+    MLFQ_NUM_LEVELS,
+    Request,
+    RequestStatus,
+    StreamingUpdate,
+    TokenRateLimiter,
+)
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
@@ -164,6 +173,9 @@ class Scheduler(SchedulerInterface):
             raise ValueError(
                 f"Unknown scheduling policy: {self.scheduler_config.policy}"
             ) from e
+        # QoS priority is active when the scheduling policy is PRIORITY.
+        self.enable_qos_priority: bool = (
+            self.policy == SchedulingPolicy.PRIORITY)
         # Priority queues for requests.
         self.waiting = create_request_queue(self.policy)
         # requests skipped in waiting flow due async deps or constraints.
@@ -299,6 +311,74 @@ class Scheduler(SchedulerInterface):
             )
 
         self._pause_state: PauseState = PauseState.UNPAUSED
+
+        # ==================================================================
+        # QoS Scheduling Optimizations (ported from the legacy scheduler).
+        # Each optimization is enabled by default and can be disabled via
+        # VLLM_DISABLE_* env vars for A/B baseline comparison tests.
+        # ==================================================================
+
+        # ---- MLFQ (Multi-Level Feedback Queue) Scheduling ----
+        # Requests start at L0 (highest priority) and are demoted as they
+        # consume more tokens. Scheduling picks from the highest non-empty
+        # level first; within a level, FCFS ordering is used.
+        self.enable_mlfq: bool = os.environ.get("VLLM_DISABLE_MLFQ") != "1"
+        # Multi-level waiting queues: mlfq_queues[i] holds waiting requests
+        # at MLFQ level i. Level 0 = highest priority (interactive).
+        self.mlfq_queues: list[deque[Request]] = [
+            deque() for _ in range(MLFQ_NUM_LEVELS)
+        ]
+
+        # ---- Cache-Aware Scheduling ----
+        # When enabled (and prefix caching is on), scan top-K candidates
+        # within the same MLFQ level and re-order by actual prefill tokens
+        # (ascending), so requests with higher cache hit rates are scheduled
+        # first.
+        self.enable_cache_aware_scheduling: bool = (
+            self.cache_config.enable_prefix_caching)
+        self.cache_aware_scan_window: int = 8
+
+        # ---- Token Rate Limiting (Token Bucket) ----
+        # Running requests are rate-limited based on priority. High-priority
+        # requests are not limited; low-priority requests are throttled under
+        # load so token_budget is freed for high-priority requests.
+        self.enable_token_rate_limiting: bool = (
+            os.environ.get("VLLM_DISABLE_RATE_LIMIT") != "1")
+
+        # ---- Prefill Budget Isolation ----
+        # Prevents long-prefill requests from starving short interactive
+        # requests by reserving a portion of token_budget for short requests
+        # and limiting concurrent long prefills per step.
+        self.long_prefill_threshold: int = 1024  # tokens
+        self.short_budget_reserve_ratio: float = 0.3  # 30% for short reqs
+        self.max_concurrent_long_prefill: int = 2
+
+        # ---- Overload Management ----
+        # (a) Admission control: reject low-priority requests when queue
+        #     depth or SLA violation rate is too high.
+        # (b) Deadline-aware scheduling: requests closer to SLA deadline are
+        #     scheduled with higher urgency.
+        # (c) SLA-aware preemption: already-violated requests are preempted
+        #     first to salvage resources.
+        self.enable_overload_management: bool = (
+            os.environ.get("VLLM_DISABLE_OVERLOAD_MGMT") != "1")
+        self.max_queue_depth: int = 100
+        self._sla_violation_window: deque[bool] = deque(maxlen=50)
+        self.overload_violation_threshold: float = 0.5  # 50% → reject low
+        self.enable_deadline_aware_scheduling: bool = (
+            self.enable_overload_management
+            and os.environ.get("VLLM_DISABLE_DEADLINE_AWARE") != "1")
+        self.deadline_urgency_threshold_s: float = 2.0  # seconds
+
+        # ---- Tenant-Level Resource Isolation ----
+        # Prevents a single large tenant from starving others by enforcing
+        # per-tenant concurrency caps and weighted fair scheduling (WFQ).
+        self.tenant_manager = TenantManager(
+            default_max_running=max(1, self.max_num_running_reqs // 2),
+            default_weight=1.0,
+        )
+        self.enable_tenant_isolation: bool = (
+            os.environ.get("VLLM_DISABLE_TENANT_ISO") != "1")
 
     def _mamba_block_aligned_split(
         self,
@@ -1900,6 +1980,213 @@ class Scheduler(SchedulerInterface):
 
     def set_pause_state(self, pause_state: PauseState) -> None:
         self._pause_state = pause_state
+
+    # ======================================================================
+    # QoS Optimization Methods (ported from the legacy scheduler).
+    # ======================================================================
+
+    def _is_high_priority_request(self, request: Request) -> bool:
+        """Determine if a request qualifies as high priority.
+
+        High-priority requests are never rejected by admission control
+        and are given scheduling preference.
+        """
+        # By MLFQ level (new requests always start at L0).
+        if self.enable_mlfq and request.mlfq_level <= 1:
+            return True
+        # By explicit API priority.
+        if request.priority < 0:
+            return True
+        # By short prompt (interactive traffic).
+        if request.num_prompt_tokens < Request.SHORT_PROMPT_THRESHOLD:
+            return True
+        return False
+
+    def _should_admit(self, request: Request) -> bool:
+        """Admission control: decide whether to accept a new request.
+
+        Rejection criteria (applied in order):
+        1. Queue depth exceeds ``max_queue_depth`` AND the request is
+           not high-priority → reject (HTTP 503).
+        2. Recent SLA violation rate exceeds threshold AND the request
+           is not high-priority → reject.
+
+        High-priority requests are *never* rejected, ensuring Gold-tier
+        SLAs are maintained even under severe overload.
+        """
+        is_high_priority = self._is_high_priority_request(request)
+
+        # High-priority requests are always admitted.
+        if is_high_priority:
+            return True
+
+        # (1) Queue depth gate.
+        if len(self.waiting) >= self.max_queue_depth:
+            logger.info(
+                "Admission control: rejecting req %s — queue depth "
+                "%d >= %d", request.request_id, len(self.waiting),
+                self.max_queue_depth)
+            return False
+
+        # (2) SLA violation rate gate.
+        if len(self._sla_violation_window) >= 10:
+            violation_rate = (
+                sum(self._sla_violation_window)
+                / len(self._sla_violation_window))
+            if violation_rate > self.overload_violation_threshold:
+                logger.info(
+                    "Admission control: rejecting req %s — SLA "
+                    "violation rate %.1f%% > %.1f%%",
+                    request.request_id,
+                    violation_rate * 100,
+                    self.overload_violation_threshold * 100)
+                return False
+
+        return True
+
+    @property
+    def sla_violation_rate(self) -> float:
+        """Current SLA violation rate from the sliding window."""
+        if not self._sla_violation_window:
+            return 0.0
+        return sum(self._sla_violation_window) / len(
+            self._sla_violation_window)
+
+    def _select_preemption_victim(self) -> Request | None:
+        """Select the best preemption victim using SLA-aware heuristics.
+
+        Selection order:
+        1. Already SLA-violated requests (they can't be saved). Among these,
+           pick the lowest priority (highest effective_priority value).
+        2. Fallback to standard QoS priority.
+        """
+        if not self.running:
+            return None
+
+        if self.enable_overload_management:
+            # Prefer to preempt already-violated requests.
+            violated = [r for r in self.running if r.is_sla_violated()]
+            if violated:
+                return max(
+                    violated,
+                    key=lambda r: (r.effective_priority, r.arrival_time))
+
+        # Standard fallback: preempt lowest-priority running request.
+        if self.enable_qos_priority:
+            return max(
+                self.running,
+                key=lambda r: (r.effective_priority, r.arrival_time))
+
+        # FCFS fallback: preempt last added.
+        return self.running[-1]
+
+    def _deadline_aware_sort_waiting(self) -> None:
+        """Boost urgent requests within each MLFQ level.
+
+        Requests whose ``slack_time`` is below the urgency threshold are
+        moved to the front of their MLFQ level queue. This does NOT cross
+        MLFQ level boundaries.
+        """
+        if not self.enable_mlfq:
+            return
+
+        for level_queue in self.mlfq_queues:
+            if len(level_queue) <= 1:
+                continue
+            urgent = []
+            normal = []
+            for r in level_queue:
+                if r.sla_urgency < self.deadline_urgency_threshold_s:
+                    urgent.append(r)
+                else:
+                    normal.append(r)
+            if urgent:
+                urgent.sort(key=lambda r: r.sla_urgency)
+                level_queue.clear()
+                level_queue.extend(urgent)
+                level_queue.extend(normal)
+
+    def _cache_aware_select_next(
+        self,
+    ) -> tuple[Request, list, int] | None:
+        """Select the next WAITING request using cache-aware ordering.
+
+        Within the highest non-empty MLFQ level, scan up to
+        ``cache_aware_scan_window`` candidates and return the one that
+        requires the fewest new prefill tokens (i.e. highest cache hit rate).
+        """
+        for level_queue in self.mlfq_queues:
+            if not level_queue:
+                continue
+
+            k = min(self.cache_aware_scan_window, len(level_queue))
+            candidates = list(itertools.islice(level_queue, k))
+
+            best: tuple[int, Request, list, int] | None = None
+            for req in candidates:
+                computed_blocks, num_computed_tokens = (
+                    self.kv_cache_manager.get_computed_blocks(req))
+                actual_prefill = req.num_tokens - num_computed_tokens
+                if best is None or actual_prefill < best[0]:
+                    best = (actual_prefill, req, computed_blocks,
+                            num_computed_tokens)
+
+            if best is not None:
+                _, req, comp_blocks, n_computed = best
+                return (req, comp_blocks, n_computed)
+
+        return None
+
+    def _get_priority_tier(self, request: Request) -> str:
+        """Classify a request into HIGH / NORMAL / LOW priority tier."""
+        if self.enable_mlfq:
+            if request.mlfq_level <= 1:
+                return "HIGH"
+            elif request.mlfq_level == 2:
+                return "NORMAL"
+            else:
+                return "LOW"
+        elif self.enable_qos_priority:
+            ep = request.effective_priority
+            if ep < 0:
+                return "HIGH"
+            elif ep < 5:
+                return "NORMAL"
+            else:
+                return "LOW"
+        else:
+            # No priority information — treat all as HIGH (no limiting).
+            return "HIGH"
+
+    def _update_rate_limiters(self) -> None:
+        """Update rate limiters for all running requests based on system load."""
+        if not self.running:
+            return
+
+        load = len(self.running) / max(1, self.max_num_running_reqs)
+
+        for request in self.running:
+            rl = request.rate_limiter
+            rl.refill()
+            tier = self._get_priority_tier(request)
+
+            if load < TokenRateLimiter.LOAD_THRESHOLD_MODERATE:
+                rl.set_rate(math.inf)
+            elif load < TokenRateLimiter.LOAD_THRESHOLD_HIGH:
+                if tier == "HIGH":
+                    rl.set_rate(math.inf)
+                elif tier == "NORMAL":
+                    rl.set_rate(TokenRateLimiter.DEFAULT_RATE_NORMAL)
+                else:  # LOW
+                    rl.set_rate(TokenRateLimiter.DEFAULT_RATE_LOW)
+            else:
+                if tier == "HIGH":
+                    rl.set_rate(math.inf)
+                elif tier == "NORMAL":
+                    rl.set_rate(TokenRateLimiter.DEFAULT_RATE_LOW * 2)
+                else:  # LOW
+                    rl.set_rate(
+                        max(1.0, TokenRateLimiter.DEFAULT_RATE_LOW / 2))
 
     def get_num_unfinished_requests(self) -> int:
         if self._pause_state == PauseState.PAUSED_ALL:

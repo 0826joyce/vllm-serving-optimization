@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import enum
+import math
 import time
 from collections import deque
 from collections.abc import Callable, Mapping
@@ -56,6 +57,109 @@ class StreamingUpdate:
         )
 
 
+class TokenRateLimiter:
+    """Per-request token bucket rate limiter.
+
+    Each request carries its own token bucket.  The bucket is refilled at
+    ``rate`` tokens per scheduling step.  ``burst`` controls the maximum
+    number of tokens that can accumulate (for bursty generation).
+
+    A rate of ``math.inf`` means *no limit* (high-priority / idle system).
+    """
+
+    # Default rates per priority tier.  These are overridden by the
+    # scheduler based on system load.
+    #   HIGH  -> unlimited (no throttle)
+    #   NORMAL -> moderate limit under load
+    #   LOW   -> aggressive limit under load
+    DEFAULT_RATE_HIGH: float = math.inf
+    DEFAULT_RATE_NORMAL: float = 64.0   # tokens per step
+    DEFAULT_RATE_LOW: float = 16.0      # tokens per step
+    DEFAULT_BURST: int = 128            # max burst capacity
+
+    # Load thresholds: when the fraction of running requests relative to
+    # max_num_running_reqs exceeds these thresholds, rate limiting kicks in.
+    LOAD_THRESHOLD_MODERATE: float = 0.5   # 50% → start limiting low-prio
+    LOAD_THRESHOLD_HIGH: float = 0.8       # 80% → aggressive limiting
+
+    def __init__(
+        self,
+        rate: float = math.inf,
+        burst: int = 128,
+    ) -> None:
+        self.rate = rate      # tokens replenished per step
+        self.burst = burst    # maximum bucket capacity
+        self.tokens = float(burst)  # current available tokens
+
+    def refill(self) -> None:
+        """Refill the bucket (called once per scheduling step)."""
+        if self.rate == math.inf:
+            self.tokens = float(self.burst)
+        else:
+            self.tokens = min(self.tokens + self.rate, float(self.burst))
+
+    def consume(self, requested: int) -> int:
+        """Try to consume ``requested`` tokens.
+
+        Returns the number of tokens actually allowed (may be less than
+        ``requested`` if the bucket is drained).
+        """
+        if self.rate == math.inf:
+            return requested
+        allowed = min(requested, max(0, int(self.tokens)))
+        self.tokens -= allowed
+        return allowed
+
+    def available(self) -> int:
+        """Return the number of tokens currently available."""
+        if self.rate == math.inf:
+            return 2**31  # effectively unlimited
+        return max(0, int(self.tokens))
+
+    def set_rate(self, rate: float, burst: int | None = None) -> None:
+        """Dynamically adjust the rate and optionally the burst size."""
+        self.rate = rate
+        if burst is not None:
+            self.burst = burst
+
+    def is_limited(self) -> bool:
+        """Return True if this limiter imposes any restriction."""
+        return self.rate != math.inf
+
+
+# ---- MLFQ Level Configuration ----
+# Multi-Level Feedback Queue: requests start at the highest priority level
+# (L0) and are demoted to lower levels as they consume more token budget.
+# Short requests naturally finish at high levels; long requests gradually
+# sink to lower levels — no explicit priority annotation needed.
+
+class MLFQLevel:
+    """Configuration for a single MLFQ level."""
+
+    def __init__(self, level: int, name: str, token_quota: float):
+        self.level = level
+        self.name = name
+        # Max cumulative tokens a request can consume at this level
+        # before being demoted to the next level.
+        self.token_quota = token_quota
+
+    def __repr__(self) -> str:
+        return f"MLFQLevel(L{self.level}, {self.name}, quota={self.token_quota})"
+
+
+# Default MLFQ level definitions.
+# token_quota is the cumulative token budget threshold for demotion.
+MLFQ_LEVELS: list[MLFQLevel] = [
+    MLFQLevel(level=0, name="interactive", token_quota=128),
+    MLFQLevel(level=1, name="standard", token_quota=512),
+    MLFQLevel(level=2, name="batch", token_quota=2048),
+    MLFQLevel(level=3, name="background", token_quota=math.inf),
+]
+
+# Number of MLFQ levels.
+MLFQ_NUM_LEVELS: int = len(MLFQ_LEVELS)
+
+
 class Request:
 
     # ---- QoS Priority Configuration ----
@@ -98,12 +202,31 @@ class Request:
         resumable: bool = False,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
+        tenant_id: str = "default",
+        sla_ttft_ms: float = float("inf"),
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
         self.priority = priority
         # QoS: cached effective priority (updated by scheduler each step)
         self._effective_priority: int | None = None
+        # Tenant-level isolation: which tenant this request belongs to.
+        self.tenant_id = tenant_id
+        # SLA / Deadline tracking (Phase 4).
+        # sla_ttft_ms: maximum acceptable time-to-first-token in ms.
+        # deadline: absolute monotonic time by which TTFT must occur.
+        self.sla_ttft_ms = sla_ttft_ms
+        self.deadline: float = (
+            self.arrival_time + sla_ttft_ms / 1000.0
+            if sla_ttft_ms < float("inf")
+            else float("inf")
+        )
+        # Token rate limiter (per-request token bucket).
+        self.rate_limiter: TokenRateLimiter = TokenRateLimiter()
+        # Current MLFQ level (0 = highest priority, MLFQ_NUM_LEVELS-1 = lowest).
+        self.mlfq_level: int = 0
+        # Cumulative output tokens consumed (for MLFQ demotion).
+        self.mlfq_tokens_consumed: int = 0
         self.sampling_params = sampling_params
         self.pooling_params = pooling_params
         self.lora_request = lora_request
@@ -371,6 +494,58 @@ class Request:
         # Combine: lower value = higher priority
         self._effective_priority = base + length_adjustment - starvation_boost
         return self._effective_priority
+
+    def mlfq_account_tokens(self, num_tokens: int) -> None:
+        """Account for tokens consumed by this request in the MLFQ.
+
+        Called after each scheduling step with the number of *output* tokens
+        generated.  When the cumulative consumption exceeds the current
+        level's quota the request is automatically demoted.
+        """
+        self.mlfq_tokens_consumed += num_tokens
+        # Check if demotion is needed.
+        current_level = MLFQ_LEVELS[self.mlfq_level]
+        if (self.mlfq_tokens_consumed >= current_level.token_quota
+                and self.mlfq_level < MLFQ_NUM_LEVELS - 1):
+            self.mlfq_level += 1
+
+    def mlfq_promote(self) -> None:
+        """Promote the request by one MLFQ level (anti-starvation).
+
+        Called when a request is preempted — it gets promoted one level
+        (but not beyond L0) so that it receives slightly better treatment
+        when re-scheduled.  The token consumption counter is **not** reset
+        so that the request cannot game the system by being repeatedly
+        preempted.
+        """
+        if self.mlfq_level > 0:
+            self.mlfq_level -= 1
+
+    # ---- SLA / Deadline Methods (Phase 4) ----
+
+    @property
+    def slack_time(self) -> float:
+        """Remaining time before SLA deadline (seconds).
+
+        Positive = still within SLA; negative = already violated.
+        Returns ``float('inf')`` if no SLA is configured.
+        """
+        if self.deadline == float("inf"):
+            return float("inf")
+        return self.deadline - time.monotonic()
+
+    def is_sla_violated(self) -> bool:
+        """Return True if the request has exceeded its SLA deadline."""
+        return self.slack_time <= 0
+
+    @property
+    def sla_urgency(self) -> float:
+        """Urgency score for deadline-aware scheduling.
+
+        Lower value = more urgent (closer to or past deadline).
+        Requests with no SLA get ``float('inf')`` (least urgent).
+        """
+        return self.slack_time
 
     def __lt__(self, other: "Request") -> bool:
         """
