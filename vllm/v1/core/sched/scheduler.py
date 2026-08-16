@@ -677,6 +677,35 @@ class Scheduler(SchedulerInterface):
                 assert request_queue is not None
 
                 request = request_queue.peek_request()
+
+                # ---- Cache-Aware Scheduling ----
+                # When prefix caching is enabled, scan up to
+                # ``cache_aware_scan_window`` candidates at the front of the
+                # queue and prefer the one with the most pre-computed tokens
+                # (i.e. fewest new prefill tokens), so cache hits are
+                # scheduled first.
+                if (
+                    self.enable_cache_aware_scheduling
+                    and len(request_queue) > 1
+                ):
+                    best_req = request
+                    best_computed = -1
+                    for candidate in itertools.islice(
+                        request_queue, self.cache_aware_scan_window
+                    ):
+                        _, num_computed = (
+                            self.kv_cache_manager.get_computed_blocks(
+                                candidate
+                            )
+                        )
+                        if num_computed > best_computed:
+                            best_req = candidate
+                            best_computed = num_computed
+                    if best_req is not request:
+                        request_queue.remove_request(best_req)
+                        request_queue.prepend_request(best_req)
+                        request = best_req
+
                 request_id = request.request_id
 
                 # ---- Tenant-level isolation: concurrency cap ----

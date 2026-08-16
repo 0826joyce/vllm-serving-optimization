@@ -549,16 +549,21 @@ class Request:
 
     def __lt__(self, other: "Request") -> bool:
         """
-        Compare two requests based on effective priority, arrival time,
-        and request ID. Used in priority scheduling.
+        Compare two requests based on effective priority, MLFQ level,
+        arrival time, and request ID. Used in priority scheduling.
 
         Uses effective_priority (multi-dimensional) if computed,
-        otherwise falls back to static priority.
+        otherwise falls back to static priority.  MLFQ level is used as a
+        secondary key so that within the same effective priority, requests
+        at a higher MLFQ level (lower level number) are scheduled first.
         """
         self_prio = self.effective_priority
         other_prio = other.effective_priority
         if self_prio != other_prio:
             return self_prio < other_prio
+        # MLFQ level as secondary key (lower level = higher priority).
+        if self.mlfq_level != other.mlfq_level:
+            return self.mlfq_level < other.mlfq_level
         if self.arrival_time != other.arrival_time:
             return self.arrival_time < other.arrival_time
         if self.request_id != other.request_id:
