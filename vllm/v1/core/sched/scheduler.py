@@ -374,7 +374,7 @@ class Scheduler(SchedulerInterface):
         # Prevents a single large tenant from starving others by enforcing
         # per-tenant concurrency caps and weighted fair scheduling (WFQ).
         self.tenant_manager = TenantManager(
-            default_max_running=max(1, self.max_num_running_reqs // 2),
+            default_max_running=self.max_num_running_reqs,
             default_weight=1.0,
         )
         self.enable_tenant_isolation: bool = (
@@ -678,33 +678,13 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
 
-                # ---- Cache-Aware Scheduling ----
-                # When prefix caching is enabled, scan up to
-                # ``cache_aware_scan_window`` candidates at the front of the
-                # queue and prefer the one with the most pre-computed tokens
-                # (i.e. fewest new prefill tokens), so cache hits are
-                # scheduled first.
-                if (
-                    self.enable_cache_aware_scheduling
-                    and len(request_queue) > 1
-                ):
-                    best_req = request
-                    best_computed = -1
-                    for candidate in itertools.islice(
-                        request_queue, self.cache_aware_scan_window
-                    ):
-                        _, num_computed = (
-                            self.kv_cache_manager.get_computed_blocks(
-                                candidate
-                            )
-                        )
-                        if num_computed > best_computed:
-                            best_req = candidate
-                            best_computed = num_computed
-                    if best_req is not request:
-                        request_queue.remove_request(best_req)
-                        request_queue.prepend_request(best_req)
-                        request = best_req
+                # NOTE: Cache-Aware scheduling is implemented via
+                # `effective_priority` (cache-hit requests get a priority
+                # boost in `_update_effective_priorities`), so no explicit
+                # queue re-ordering is needed here.  Directly manipulating the
+                # priority queue (remove+prepend) would corrupt the heap
+                # invariant and cause duplicate scheduling / assertion
+                # failures, so we deliberately do NOT reorder the queue here.
 
                 request_id = request.request_id
 
