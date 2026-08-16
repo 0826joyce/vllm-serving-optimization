@@ -1261,3 +1261,129 @@ ls results/baseline_fcfs/abs_bench/ results/optimized_qos/abs_bench/
 #   baseline_fcfs/grafana_preemptions.png - 抢占次数
 #   optimized_qos/grafana_*.png           - 同上
 ```
+
+---
+
+## 7. 测试结果记录与方案调整
+
+> 本节记录实际执行的 A/B 测试结论，以及根据测试结果对方案的调整方向。
+> 测试环境：RTX 5070 Ti（Blackwell，sm_120），Qwen2.5-1.5B-Instruct，
+> `--enforce-eager`，单实例，5 阶段混合负载（Phase 1-5，各 60s）。
+
+### 7.1 代码移植背景（重要）
+
+原始优化代码基于**旧版 vLLM 调度器结构**（`vllm/v1/core/scheduler.py` 单文件），
+而运行环境是**官方 vLLM v0.20.2**（调度器已重构为 `vllm/v1/core/sched/scheduler.py`
++ `RequestQueue` 抽象）。两者 API 不兼容，直接在仓库目录启动会因新旧代码混血导致大量
+`ImportError` / `NameError`。
+
+因此将全部优化**移植到基于官方 v0.20.2 的新分支** `feature/qos-optimization-v0202`：
+
+| 优化 | 移植位置 | 开关 |
+|------|---------|------|
+| QoS 优先级 | `effective_priority`（v0.20.2 已内置 `_update_effective_priorities`） | `--scheduling-policy priority` |
+| MLFQ 多级反馈 | `request.mlfq_level` + `update_from_output` 降级 | `VLLM_DISABLE_MLFQ` |
+| Token 限速 | `TokenRateLimiter` + `schedule()` 接入 | `VLLM_DISABLE_RATE_LIMIT` |
+| 租户隔离 | `TenantManager` + `schedule()` 并发上限 | `VLLM_DISABLE_TENANT_ISO` |
+| 过载管理准入 | `_should_admit` + `add_request()` | `VLLM_DISABLE_OVERLOAD_MGMT` |
+| Deadline-aware | `_deadline_aware_sort_waiting` + `schedule()` | `VLLM_DISABLE_DEADLINE_AWARE` |
+| Prefill 预算隔离 | `schedule()` WAITING 循环接入 | — |
+
+### 7.2 A/B 测试结论（2026-08-16）
+
+#### 分阶段违约率对比
+
+| 阶段 | A 基线(FCFS) | B 优化(priority) | 结论 |
+|------|-------------|-----------------|------|
+| Phase 1（稳态） | 48ms, 0% | 54ms, 0.1% | 相当 |
+| Phase 2（Prompt 切换） | 86ms, 0% | 90ms, 0% | 相当 |
+| Phase 3（Gold-A 暴增 4×） | 57ms, 0% | 132ms, 0% | 相当（B 略慢但零违约） |
+| Phase 4（长文档暴增） | 94072ms, 87.9% | 87343ms, 88.1% | P99 降 9-13%，违约率持平 |
+| Phase 5（全局过载） | 14690ms, 100% | 20885ms, 100% | 都崩溃 |
+
+#### Phase 4 分租户违约率
+
+| 租户 | A 基线 | B 优化 |
+|------|--------|--------|
+| gold | 89.7% | 89.9% |
+| silver | 87.6% | ~88% |
+| bronze | 85.1% | ~85% |
+
+#### 核心结论
+
+1. **Phase 1-3（稳态~适度过载）**：优化版与基线相当，无回归，零 SLA 违约 ✅
+2. **Phase 4（长文档暴增）**：优化版 P99 TTFT 降低 9-13%，但违约率几乎持平 ❌
+3. **Phase 5（极端过载）**：两版都 100% 违约，GPU 物理算力耗尽 ❌
+
+### 7.3 为什么优化效果有限（根因分析）
+
+Phase 4/5 违约率的**根本原因是长文档 Prefill 的绝对耗时**，而非调度排序问题：
+
+1. **Bronze 长文档**（300 token 输出 + 长 prompt）在 1.5B 模型 + `--enforce-eager` 下，
+   单次 Prefill 本身就要数秒到数十秒。
+2. Phase 4 时 Bronze QPS 从 3 涨到 10，叠加 Gold-A 32 QPS，**总量超过 GPU 处理能力**。
+3. 一旦 GPU 打满，**任何调度策略都无法让所有请求满足 SLA**——物理上算不过来。
+
+因此：调度优化（QoS/MLFQ/Token 限速/租户隔离/Prefill 预算隔离）在**适度过载**下有效，
+但在**极端过载**下受限于物理算力，无法让所有请求满足 SLA。
+
+### 7.4 方案调整：准入控制阈值调优（下一步方向）
+
+真正能解决 Phase 4 的是**过载管理的「准入控制拒绝」**——当系统过载时主动拒绝
+低优先级请求（HTTP 503），而不是全收然后全部超时。
+
+当前 `_should_admit()` 的阈值**过于宽松**，导致 Phase 4 没有触发拒绝：
+
+```python
+self.max_queue_depth: int = 100              # 队列深度上限（过高）
+self.overload_violation_threshold: float = 0.5  # SLA 违约率阈值（过高）
+self._sla_violation_window: deque = deque(maxlen=50)  # 违约统计窗口
+```
+
+#### 调整思路
+
+| 参数 | 当前值 | 建议值 | 调整理由 |
+|------|--------|--------|---------|
+| `max_queue_depth` | 100 | **30~50** | Phase 4 队列深度未达 100，导致准入控制从未触发 |
+| `overload_violation_threshold` | 0.5 | **0.2~0.3** | 更早识别过载，及时拒绝低优先级请求 |
+| `_sla_violation_window` maxlen | 50 | **20~30** | 更灵敏地反映近期违约率 |
+
+#### 关键补充：准入控制必须与优先级联动
+
+准入控制的核心原则是「**保护高优先级请求，牺牲低优先级请求**」：
+
+1. **gold（priority=-2）**：永不拒绝，保证 Gold SLA
+2. **silver（priority=0）**：违约率超过阈值时拒绝
+3. **bronze（priority=2）**：队列深度或违约率一超阈值即拒绝
+
+当前 `_should_admit()` 已实现 `_is_high_priority_request()` 对高优请求放行，但
+**拒绝判定依赖的队列深度/违约率阈值过高**，导致 Phase 4 时 bronze 长文档也没被拒绝，
+反而占满 GPU 拖垮了 gold。
+
+#### 预期效果
+
+调低阈值后，Phase 4 的预期行为：
+
+- Bronze 长文档请求在过载时被**主动拒绝**（返回 503），释放 GPU 给 Gold/Silver
+- Gold 短对话违约率从 89.9% **显著下降**（理想情况下 < 10%）
+- 代价：Bronze 的拒绝率上升（但这是**符合 SLA 分级的预期行为**——牺牲低优先级保高优先级）
+
+#### 验证方法
+
+调低阈值后重跑 B 轮，重点看两个指标：
+
+1. **Phase 4 的 gold 违约率**：应从 ~90% 显著下降
+2. **Phase 4 的 bronze 拒绝率**：应明显上升（HTTP 503 数量增加）
+
+> **注意**：`workload.py` 目前把 `was_cancelled` 和 HTTP 错误都记为失败，需要确认
+> 准入控制的 503 响应能被正确记录，以便区分「主动拒绝」和「超时失败」。
+
+### 7.5 待办事项
+
+- [ ] 调低准入控制阈值（`max_queue_depth`、`overload_violation_threshold`、窗口大小）
+- [ ] 验证 priority 优先级在 Phase 4 是否真正生效（gold 应比 bronze 违约率更低）
+- [ ] 补充 workload.py 对 503 拒绝的识别（区分主动拒绝 vs 超时）
+- [ ] Cache-Aware 调度：当前因 `remove+prepend` 破坏 PriorityQueue heap 不变量而暂时
+      移除，需改为通过 `effective_priority` 融入缓存命中信息
+- [ ] 在 `vllm bench serve` 绝对性能基线上验证优化无吞吐回归
+```
