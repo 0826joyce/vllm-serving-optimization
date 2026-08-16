@@ -669,6 +669,16 @@ class Scheduler(SchedulerInterface):
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
 
+            # ---- Prefill Budget Isolation: per-step state ----
+            # Count long prefills scheduled this step, and reserve a portion
+            # of the token budget for short requests so that long-prefill
+            # (e.g. 4096-token Bronze documents) cannot starve interactive
+            # short requests.
+            long_prefill_count = 0
+            short_budget_reserved = int(
+                token_budget * self.short_budget_reserve_ratio
+            )
+
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
@@ -811,6 +821,36 @@ class Scheduler(SchedulerInterface):
 
                     num_new_tokens = min(num_new_tokens, token_budget)
                     assert num_new_tokens > 0
+
+                    # ---- Prefill Budget Isolation: long prefill control ----
+                    # A "long prefill" is a first-time prefill (no computed
+                    # tokens yet) whose new tokens exceed the threshold.
+                    is_long_prefill = (
+                        num_new_tokens > self.long_prefill_threshold
+                        and request.num_computed_tokens == 0
+                    )
+
+                    if is_long_prefill:
+                        # (a) Concurrent long-prefill cap.
+                        if (
+                            long_prefill_count
+                            >= self.max_concurrent_long_prefill
+                        ):
+                            # Don't schedule more long prefills this step;
+                            # leave budget for short requests.
+                            break
+
+                        # (b) Long prefill must not eat into the short-
+                        #     request reserved budget.
+                        effective_budget = (
+                            token_budget - short_budget_reserved
+                        )
+                        if effective_budget <= 0:
+                            break
+                        num_new_tokens = min(
+                            num_new_tokens, effective_budget
+                        )
+                        long_prefill_count += 1
 
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:
