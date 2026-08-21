@@ -1387,3 +1387,383 @@ self._sla_violation_window: deque = deque(maxlen=50)  # 违约统计窗口
       移除，需改为通过 `effective_priority` 融入缓存命中信息
 - [ ] 在 `vllm bench serve` 绝对性能基线上验证优化无吞吐回归
 ```
+
+---
+
+## 8. GPU Profiling（Nsight Systems + Nsight Compute）
+
+> 本节介绍如何用 NVIDIA 官方 Profiler 分析**优化版框架**（轮次 B，`--scheduling-policy priority`）在压测中的 GPU 真实行为。
+>
+> 与前面已介绍的三层证据的关系：
+>
+> | 层 | 工具 | 视角 | 回答的问题 |
+> |----|------|------|-----------|
+> | 客户端延迟 | `workload.py` / `vllm bench serve` | 应用层 | "SLA 违约了吗？TTFT 多少？" |
+> | 服务端状态 | Prometheus + Grafana | 调度器层 | "队列多长？KV Cache 用满了吗？抢占几次？" |
+> | **GPU 微观** | **nsys / ncu** | **硬件层** | **"GPU 利用率多少？瓶颈在访存还是算力？哪个 kernel 最慢？"** |
+>
+> 前三层回答「**什么现象**」，GPU Profiling 回答「**为什么**」——例如 §7 里 Phase 4/5「GPU 物理算力耗尽」这个结论，只有靠 nsys/ncu 才能**坐实**（看到 SM 占用率、访存吞吐、kernel 耗时）。
+
+### 8.1 工具定位
+
+| 工具 | 全称 | 采集方式 | 输出 | 本测试用途 |
+|------|------|---------|------|-----------|
+| **nsys** (Nsight Systems) | 系统级时间线分析 | 采样 + 事件追踪，**低开销**，包住整段进程 | `.nsys-rep` 时间线报告 | 宏观：看 GPU 利用率、kernel 调度、Prefill/Decode 阶段切换、是否 idle |
+| **ncu** (Nsight Compute) | 单 kernel 性能分析 | 重放/插桩单个 kernel，**高开销**，逐 kernel 精确计量 | 每个 kernel 的 SM 占用率、访存吞吐、warp stall 原因 | 微观：定位最慢 kernel 的瓶颈（算力 vs 访存 vs 延迟） |
+
+> **先 nsys 后 ncu**：nsys 先找出「哪个 kernel / 哪个阶段最耗时」，再用 ncu 对那个 kernel 做深入分析。不要一上来就用 ncu 扫全部 kernel——ncu 会重放 kernel，开销极大，压测期间跑会严重失真。
+
+### 8.2 安装（一次性）
+
+本测试环境为 **WSL + Ubuntu 26.04**，使用 NVIDIA 官方 apt 仓库安装（不需要装完整 CUDA toolkit，profiler 独立打包）：
+
+```bash
+# 1. 添加 NVIDIA 官方 apt 仓库密钥
+curl -fsSL "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb" \
+    -o /tmp/cuda-keyring.deb
+sudo dpkg -i /tmp/cuda-keyring.deb
+sudo apt-get update
+
+# 2. 安装 Nsight Systems（系统级时间线）和 Nsight Compute（单 kernel 分析）
+sudo apt-get install -y cuda-nsight-systems-13-0 cuda-nsight-compute-13-3
+
+# 3. nsys 会自动软链到 /usr/local/bin/nsys；ncu 需要手动软链
+sudo ln -sf /opt/nvidia/nsight-compute/2026.2.1/ncu /usr/local/bin/ncu
+
+# 4. 验证
+nsys --version   # 预期: NVIDIA Nsight Systems version 2025.x
+ncu --version    # 预期: NVIDIA (R) Nsight Compute ... Version 2026.x
+```
+
+> **Ubuntu 26.04 注意**：NVIDIA 仓库目前最高只发布到 `ubuntu2404`，在 26.04 上安装 `ubuntu2404` 源的包是可行的（本节命令已验证）。若未来官方出了 `ubuntu2604` 源，改用对应地址即可。
+>
+> **Blackwell（sm_120）支持**：RTX 5070 Ti 是 Blackwell 架构，务必用 **CUDA 13.x 对应版本**（nsys ≥ 2025.x、ncu ≥ 2025.4），旧版 profiler 无法正确解析 sm_120 的 kernel。
+
+### 8.3 nsys 宏观分析：整段压测全采
+
+> ⚠️ **先读这条（本 WSL 环境重要限制）**：在 WSL2 `/dev/dxg` 透传下，nsys **采不到 GPU 设备侧的 kernel 数据**（`cuda_gpu_kern_sum` 报告为空），只能采到 CPU 侧的 CUDA API 调用。完整说明与验证过程见 §8.6。本节命令是**裸 Linux 环境的标准做法**，在 WSL 下跑能走通流程、生成报告，但 GPU kernel 时间线部分是空的。
+
+#### 8.3.1 原理（关键：profile 谁）
+
+nsys 用 `nsys profile` 包住一个进程，在进程运行期间低开销采样 CPU/GPU 事件，生成 `.nsys-rep` 时间线。
+
+> ⚠️ **必须 profile 服务端进程，不是客户端**：GPU 计算（attention / GEMM / 各种 kernel）都发生在 **服务端 `api_server` 进程**里，而客户端 `workload.py` 是纯 Python `aiohttp` 程序，**自己不做任何 CUDA 计算**。如果 `nsys profile` 包住的是 `workload.py`，生成的报告里 `cuda_gpu_kern_sum` 会是空的（`does not contain CUDA kernel data`）。
+>
+> 正确做法：**用 nsys 包住服务端启动命令**，配合 `--capture-range` 只采集压测期间，避免把服务启动/模型加载阶段也采进去。
+
+#### 8.3.2 操作步骤（推荐：`--capture-range` 只采压测窗口）
+
+**终端 1：用 nsys 包住服务端启动**（服务端是优化版 B 轮配置，`/metrics` 自动开启）：
+
+```bash
+cd ~/vllm-serving-optimization && source .venv/bin/activate
+mkdir -p results/optimized_qos/nsys
+
+# nsys 包住服务端进程，cudaProfilerApi 模式：等 workload.py 触发了 start 才采
+# （这样能精确框定压测窗口，避开模型加载阶段）
+nsys profile \
+    --trace=cuda,nvtx,osrt \
+    --capture-range=cudaProfilerApi \
+    --cuda-graph-trace=node \
+    --output=results/optimized_qos/nsys/optimized_qos \
+    --force-overwrite=true \
+    --stats=true \
+    .venv/bin/python -m vllm.entrypoints.openai.api_server \
+        --model Qwen/Qwen2.5-1.5B-Instruct \
+        --max-model-len 8192 \
+        --enable-prefix-caching \
+        --scheduling-policy priority \
+        --gpu-memory-utilization 0.85 \
+        --enforce-eager \
+        --port 8000
+```
+
+> 等待看到 `Application startup complete` 后，再在终端 2 触发压测。
+
+**终端 2：跑 workload.py 压测（同时触发 profiling 开始/停止）**：
+
+```bash
+cd ~/vllm-serving-optimization && source .venv/bin/activate
+
+# 用一个小脚本：先 cudaProfilerStart，跑压测，再 cudaProfilerStop
+.venv/bin/python -c "
+import ctypes, subprocess, sys
+cuda = ctypes.CDLL('libcuda.so.1')
+cuda.cudaProfilerStart()
+sys.exit(subprocess.call([
+    '.venv/bin/python', 'benchmarks/e2e_cases/workload.py',
+    '--model', 'Qwen/Qwen2.5-1.5B-Instruct',
+    '--host', '127.0.0.1', '--port', '8000',
+    '--mode', 'single',
+    '--duration', '300',
+    '--seed', '42',
+    '--output-dir', 'results/optimized_qos/',
+]))
+"
+```
+
+> **原理**：`--capture-range=cudaProfilerApi` 让 nsys 处于"待命"状态，直到进程里调用 `cudaProfilerStart()` 才开始采集。这样采集窗口精确等于压测窗口（`--duration 300`），排除了服务启动、模型加载这些无关阶段。
+
+**备选方案（更简单，但会采进模型加载阶段）**：
+
+如果不想用 `cudaProfilerApi`，可以直接让 nsys 从启动就开始采（去掉 `--capture-range`），但这样 `.nsys-rep` 会包含数十秒的模型加载阶段，时间线里有一段是纯加载、无推理，需要手动缩放时间轴到压测段。数据量也会更大。
+
+#### 8.3.3 参数说明
+
+| 参数 | 含义 |
+|------|------|
+| `--trace=cuda,nvtx,osrt` | 采集 CUDA kernel 调用、NVTX 标记、OS 运行时线程。**不要**加 `cudnn,cublas`（vLLM 主要用自定义 kernel，加了徒增开销） |
+| `--capture-range=cudaProfilerApi` | 等进程调用 `cudaProfilerStart()` 才开始采集，精确框定压测窗口 |
+| `--cuda-graph-trace=node` | 采集 CUDA Graph 节点（vLLM 大量使用 CUDA Graph 加速 Decode，否则可能采不到 graph 内的 kernel） |
+| `--output=<路径>` | 报告文件路径（会生成 `<路径>.nsys-rep` 和 `<路径>.sqlite`） |
+| `--force-overwrite=true` | 覆盖同名旧报告 |
+| `--stats=true` | 结束时在终端打印 GPU 利用率 / kernel 耗时汇总表 |
+| `--duration 300` | 压测时长，与 §3 一致 |
+
+> **可选：限制采样范围**。300s 全采的 `.nsys-rep` 文件可能数百 MB 到数 GB。如果只想看某个 Phase（如 Phase 4 长文档暴增），可以把 `--duration` 改小（如 `--duration 60` 只看前 60s）。但初次建议全采，先建立整体认知。
+
+#### 8.3.4 查看报告
+
+```bash
+# 方式一：在 WSL 里用 nsys-ui 打开图形界面（需要 X/WSLg）
+nsys-ui results/optimized_qos/nsys/optimized_qos.nsys-rep
+
+# 方式二：命令行导出摘要（无图形界面时）
+nsys stats results/optimized_qos/nsys/optimized_qos.nsys-rep
+```
+
+> **WSL 图形界面**：WSLg 自带 GUI 支持，`nsys-ui` 可直接弹出窗口。如果无法显示，用 `nsys stats` 导出文本摘要，或把 `.nsys-rep` 拷到 Windows 侧用 Nsight Systems 桌面版打开。
+
+#### 8.3.5 时间线里看什么（对照 5 个 Phase）
+
+| 观察点 | 怎么找 | 预期（优化版） | 对应结论 |
+|--------|--------|---------------|---------|
+| **GPU 利用率** | 时间线顶部 GPU 活动占比 | Phase 1-3 高（>70%），Phase 4/5 接近 100% 饱和 | 坐实 §7「Phase 4/5 算力耗尽」 |
+| **GPU idle 气泡** | 时间线里 GPU 空白的间隙 | idle 间隙对应调度切换/排队，优化版 Phase 3 应比基线少 | 调度优化的 GPU 证据 |
+| **Prefill vs Decode 阶段** | NVTX 标记（若 vLLM 有打标）或 kernel 名区分 | Phase 4 长文档 Prefill 段明显变长 | 长文档 Prefill 瓶颈 |
+| **kernel 调用密度** | Decode 阶段大量小 kernel 高频调用 | 优化版 Decode 不应受影响 | 调度优化不应拖慢 Decode |
+| **内存拷贝/同步** | `cudaMemcpy` / `cudaDeviceSynchronize` 事件 | 不应出现大量同步等待 | 是否有不必要的 host-device 同步 |
+
+> **为什么优化版 Phase 4 仍违约**：在 nsys 时间线上，你会看到 Phase 4 开始后 GPU 利用率立刻顶到 100% 并持续到结束——这直观印证 §7.3 的根因：**不是调度排序问题，而是物理算力打满**。调度优化（QoS/MLFQ 等）只能决定「谁先上」，不能凭空增加算力。
+
+### 8.4 ncu 微观分析：单 kernel 定位瓶颈
+
+> ⚠️ **环境提示**：本测试环境是 WSL + Blackwell，ncu 因 `ERR_NVGPUCTRPERM` **无法使用**（详见 §8.6 已实测确认）。本节命令在**裸 Linux** 环境下为标准做法，先阅读 §8.6 了解如何在 WSL 下解决后，再回来执行。
+
+#### 8.4.1 原理与适用场景
+
+ncu 对**单个 kernel launch** 做精确计量（SM 占用率、访存吞吐、warp stall 原因、寄存器/共享内存使用等），它需要**重放** kernel 多次，开销巨大。因此：
+
+- **不能**在压测期间对整个服务跑 ncu（会严重失真甚至 OOM）
+- **正确用法**：先让 nsys 找出最耗时的 kernel（如 attention / GEMM / 自定义 kernel），再用 ncu **单独测那个 kernel**
+
+#### 8.4.2 找出目标 kernel
+
+先用 nsys 报告找出热点 kernel：
+
+```bash
+nsys stats --report cuda_gpu_kern_sum results/optimized_qos/nsys/optimized_qos.nsys-rep
+```
+
+输出会按 kernel 总耗时排序，形如：
+
+```
+Time (%)  Total Time (ns)  Instances  Avg (ns)  Kernel Name
+---------------------------------------------------------------
+ 42.3     123456789000     5000       24691357   void marlin_moe(...)
+ 18.7     54567890000      3000       18189296   void paged_attention_v1(...)
+  ...
+```
+
+记下占比最高的 kernel 名字（如 `paged_attention_v1` / `marlin_*` / 自定义调度相关 kernel）。
+
+#### 8.4.3 用 ncu 分析单个 kernel
+
+由于 vLLM 服务是常驻进程，ncu 有两种接法：
+
+**方式 A：`--launch-skip` + `--launch-count`（推荐，服务不重启）**
+
+```bash
+# 只 profile 第 100 次之后、共 5 次的 paged_attention_v1 kernel
+ncu \
+    --kernel-name regex:paged_attention \
+    --launch-skip 100 \
+    --launch-count 5 \
+    --set full \
+    --target-processes all \
+    --export results/optimized_qos/nsys/attention_kernel \
+    python -m vllm.entrypoints.openai.api_server \
+        --model Qwen/Qwen2.5-1.5B-Instruct \
+        --max-model-len 8192 \
+        --enable-prefix-caching \
+        --scheduling-policy priority \
+        --gpu-memory-utilization 0.85 \
+        --enforce-eager \
+        --port 8000
+```
+
+> ncu 会**接管服务进程的启动**（`ncu ... python -m vllm...`）。启动后在另一个终端发少量请求触发目标 kernel，ncu 采集完指定的 launch 次数后自动结束。
+
+**方式 B：attach 到已运行的服务**
+
+```bash
+# 先正常启动服务，再找到其 PID，用 ncu attach
+ncu --kernel-name regex:paged_attention \
+    --launch-count 5 \
+    --set full \
+    --target-processes <vllm_pid>
+```
+
+> 方式 A 更干净（避免 attach 竞态），推荐先用 A。若服务启动参数复杂、想复用已就绪的服务，再用 B。
+
+#### 8.4.4 参数说明
+
+| 参数 | 含义 |
+|------|------|
+| `--kernel-name regex:paged_attention` | 用正则匹配目标 kernel（`regex:` 前缀） |
+| `--launch-skip 100` | 跳过前 100 次 launch（等预热稳定） |
+| `--launch-count 5` | 采集 5 次（ncu 会多次重放取统计，5 次足够） |
+| `--set full` | 采集完整指标集（SM 占用/访存/warp stall 等）。可用 `basic` 加快速度 |
+| `--export <路径>` | 导出 `.ncu-rep` 报告文件 |
+| `--target-processes all` | profile 所有子进程（vLLM 会 fork 多个 worker） |
+
+#### 8.4.5 查看与解读
+
+```bash
+# 打开图形报告（WSLg）
+ncu-ui results/optimized_qos/nsys/attention_kernel.ncu-rep
+
+# 或命令行直接看关键指标（不指定 kernel 名时打印默认 section）
+ncu --import results/optimized_qos/nsys/attention_kernel.ncu-rep
+```
+
+重点看以下 section，判断瓶颈类型：
+
+| Section | 指标 | 瓶颈判断 |
+|---------|------|---------|
+| **GPU Speed Of Light** | Compute (SM) Throughput / Memory Throughput | SM% 高→算力瓶颈；Memory% 高→访存瓶颈 |
+| **Occupancy** | Achieved / Theoretical Occupancy | 低→warp 没填满 SM，可能是寄存器/共享内存超限 |
+| **Warp State Statistics** | Stall Long Scoreboard / Stall Wait | 看 warp 主要卡在什么（访存延迟 vs 同步 vs 算力） |
+| **Memory Workload Analysis** | 各内存吞吐、cache 命中率 | 访存瓶颈时定位是全局内存还是 L2 |
+
+> **对本测试的意义**：如果 ncu 显示 `paged_attention` 的 Memory Throughput 接近 100%（访存瓶颈），说明 1.5B 小模型在 5070 Ti 上受限于 KV Cache 访存，而非算力——这进一步解释 §7 里 Phase 4/5 为何调度优化帮不上忙（瓶颈在硬件访存带宽，不在调度顺序）。
+
+### 8.5 与 Prometheus/Grafana 的协同
+
+nsys/ncu 和 Prometheus/Grafana 是**互补**的，建议同时采：
+
+| 维度 | Prometheus/Grafana | nsys/ncu |
+|------|-------------------|----------|
+| 时间分辨率 | 5s 一次（scrape 间隔） | 纳秒级（kernel 级） |
+| 观察对象 | 调度器内部状态（队列/KV Cache/抢占） | GPU 硬件活动（kernel/SM/访存） |
+| 回答 | "调度器在干什么" | "GPU 在干什么" |
+
+**联合分析套路**（以 Phase 4 为例）：
+
+1. Grafana 看到 `num_requests_waiting` 飙升、`kv_cache_usage_perc` 打满 → 确认过载发生在调度层
+2. nsys 看到 GPU 利用率顶到 100%、Prefill 段变长 → 确认是真实算力/访存耗尽
+3. ncu 看到热点 kernel Memory Throughput ≈ 100% → 定位具体瓶颈在访存
+
+三步闭环，从「现象」到「根因」完整覆盖。
+
+### 8.6 注意事项与常见坑
+
+| 现象 | 原因 | 解决 |
+|------|------|------|
+| `nsys profile` 报权限错误 | WSL 下 perf 计数器受限 | `sudo nsys profile ...`，或先确认 driver 已启用 persistence mode（`nvidia-smi` 里应为 Enabled） |
+| `.nsys-rep` 文件巨大 | 300s 全采 + 高频 kernel | 用 `--trace=cuda` 去掉 osrt/nvtx 减量；或缩短 `--duration` |
+| `cuda_gpu_kern_sum` 报告为空 | WSL dxg 透传不暴露 GPU 设备侧事件 | **已实测确认**：WSL 下 nsys 采不到 GPU kernel，见下条 |
+| ncu 报 `ERR_NVGPUCTRPERM` | WSL dxg 透传无性能计数器接口 | **已实测确认无解**，见下条 |
+
+> ⚠️ **WSL2 `/dev/dxg` 透传下，nsys 和 ncu 都无法做 GPU 设备侧 profiling（本环境已实测确认）**：
+>
+> 本测试环境是 **WSL2 + RTX 5070 Ti（Blackwell sm_120）**，经排查确认为 WSL2 的 `/dev/dxg` GPU 透传模式：
+>
+> ```
+> $ ls /dev/dxg          # → 存在（dxg 透传的标志）
+> $ ls /dev/nvidia*      # → 不存在（没有原生 CUDA 设备节点）
+> $ which nvidia-smi     # → /usr/lib/wsl/lib/nvidia-smi（WSL 转译版，非真驱动）
+> ```
+>
+> 这种模式下，Linux 侧 CUDA 调用经 dxg 层**转发**给 Windows 驱动，**GPU 设备侧的 profiling 事件（CUPTI 设备事件 / NVPC 计数器）在 dxg 转译层被挡掉**。实测结论：
+>
+> | 工具 | CPU 侧 CUDA API 追踪 | GPU 侧 kernel 追踪 | 报错/现象 |
+> |------|---------------------|-------------------|----------|
+> | **nsys** | ✅ 能采到（如 `cudaLaunchKernel` 调用次数、耗时） | ❌ 采不到 | `cuda_gpu_kern_sum` 报告为空（`does not contain CUDA kernel data`） |
+> | **ncu** | — | ❌ 无法用 | `ERR_NVGPUCTRPERM` |
+>
+> **关键实测证据**（均在本环境验证）：
+> 1. `nsys profile --trace=cuda` 包住服务端跑压测 → `cuda_api_sum` 报告有数据（`cudaLaunchKernel` 190 万次），但 `cuda_gpu_kern_sum` / `cuda_gpu_mem_time_sum` 报告**全为空**；
+> 2. 用最简单的 `torch` matmul 脚本（单 kernel）测 nsys → 同样采不到 GPU kernel，确认不是 vLLM 特有，而是环境限制；
+> 3. `sudo ncu ...` → 报 `ERR_NVGPUCTRPERM`；
+> 4. 修改 Windows 注册表 `RestrictProfilingToAdminUsers=0` + `wsl --shutdown` → ncu 仍报同样的错；
+> 5. WSL 的 `libcuda.so.1`（`/usr/lib/wsl/lib/`）缺失 `cudaProfilerStart` 符号，`--capture-range=cudaProfilerApi` 也无法用。
+>
+> **结论**：在 WSL2 `/dev/dxg` 透传模式下，**nsys 和 ncu 都无法做 GPU 设备侧 profiling，且 WSL 内无任何配置可解**。这两个工具都依赖 CUPTI 的设备侧事件（NVPC），而 dxg 透传层没有暴露这个接口。
+>
+> 要真正用上 GPU profiling，必须换环境：
+>
+> - **裸 Linux**（物理机或 VFIO GPU 直通虚拟机）：nsys / ncu 均标准可用，本文档 §8.3 / §8.4 命令可直接复用；
+> - **云 GPU 裸机实例**（AWS/GCP 等）：通常可用。
+>
+> **在本 WSL 环境下能拿到的 profiling 信息有限**：
+> - nsys 能采到 **CPU 侧 CUDA API 调用**（kernel 的 launch 次数、API 耗时），可粗略推断 GPU 忙闲，但**看不到 kernel 在 GPU 上的实际执行时间、SM 占用率、访存吞吐**；
+> - 若只是了解工具用法、熟悉命令，nsys 仍可跑通流程（会生成报告，只是 GPU kernel 部分为空）。
+
+> **补充：`ERR_NVGPUCTRPERM` 在不同环境下的含义不同**：
+> - **裸 Linux**：通常是权限问题，改 `NVreg_RestrictProfilingToAdminUsers=0` 或用 root 可解；
+> - **WSL2 dxg 透传**：架构性无解（本环境），改注册表也无效；
+> - `ERR_PROFILING_NOT_SUPPORTED`：驱动/硬件不支持 profiling（云 GPU、虚拟化 GPU），无解，只能换硬件。
+
+### 8.7 完整流程速查（Profiling 版）
+
+```bash
+cd ~/vllm-serving-optimization && source .venv/bin/activate
+
+# ===== 终端 1：用 nsys 包住服务端启动（优化版 B 轮，cudaProfilerApi 模式） =====
+mkdir -p results/optimized_qos/nsys
+nsys profile \
+    --trace=cuda,nvtx,osrt \
+    --capture-range=cudaProfilerApi \
+    --cuda-graph-trace=node \
+    --output=results/optimized_qos/nsys/optimized_qos \
+    --force-overwrite=true --stats=true \
+    .venv/bin/python -m vllm.entrypoints.openai.api_server \
+        --model Qwen/Qwen2.5-1.5B-Instruct --max-model-len 8192 \
+        --enable-prefix-caching --scheduling-policy priority \
+        --gpu-memory-utilization 0.85 --enforce-eager --port 8000
+# 等看到 "Application startup complete" 再执行终端 2
+
+# ===== 终端 2：触发 profiling + 跑压测 =====
+.venv/bin/python -c "
+import ctypes, subprocess, sys
+cuda = ctypes.CDLL('libcuda.so.1')
+cuda.cudaProfilerStart()
+sys.exit(subprocess.call([
+    '.venv/bin/python', 'benchmarks/e2e_cases/workload.py',
+    '--model', 'Qwen/Qwen2.5-1.5B-Instruct',
+    '--host', '127.0.0.1', '--port', '8000',
+    '--mode', 'single', '--duration', '300', '--seed', '42',
+    '--output-dir', 'results/optimized_qos/',
+]))
+"
+# 压测结束后，终端 1 的 nsys 会自动停止采集并生成报告
+
+# ===== 查看 nsys 报告 =====
+nsys-ui results/optimized_qos/nsys/optimized_qos.nsys-rep   # 图形
+nsys stats --report cuda_gpu_kern_sum results/optimized_qos/nsys/optimized_qos.nsys-rep  # 找热点 kernel
+
+# ===== ncu 深入热点 kernel（微观，需另起服务） =====
+ncu \
+    --kernel-name regex:<热点kernel名> \
+    --launch-skip 100 --launch-count 5 \
+    --set full \
+    --export results/optimized_qos/nsys/hot_kernel \
+    python -m vllm.entrypoints.openai.api_server \
+        --model Qwen/Qwen2.5-1.5B-Instruct --max-model-len 8192 \
+        --enable-prefix-caching --scheduling-policy priority \
+        --gpu-memory-utilization 0.85 --enforce-eager --port 8000
+
+# ===== 查看 ncu 报告 =====
+ncu-ui results/optimized_qos/nsys/hot_kernel.ncu-rep
+```
