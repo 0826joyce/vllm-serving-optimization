@@ -22,6 +22,132 @@
 
 ---
 
+## 0.5 快速开始（本机验证过的 Windows 完整命令）
+
+> 本小节是「直接抄作业」版本，命令在本机（RTX 5070 Ti + Windows + 管理员终端）实测通过。
+> 详细原理见下文各节。
+
+### 环境准备（一次性）
+
+```powershell
+# 1) Python 独立 venv + CUDA 版 PyTorch
+python -m venv C:\profiling-lab
+C:\profiling-lab\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cu128
+
+# 2) 基准脚本复制到 venv 目录
+Copy-Item "d:\code\vllm-serving-optimization\benchmarks\e2e_cases\roofline_bench.py" "C:\profiling-lab\roofline_bench.py"
+
+# 3) 允许非管理员访问 GPU 性能计数器（管理员 PowerShell 执行，重启后生效）
+reg add "HKLM\SYSTEM\CurrentControlSet\Services\nvlddmkm\Global\NVTweak" /v "RestrictProfilingToAdminUsers" /t REG_DWORD /d 0 /f
+```
+
+> 注意：注册表改完要**重启电脑**才生效；如果不想改注册表，直接全程用管理员终端跑 ncu 也行。
+
+### 快速命令（每次直接用）
+
+```powershell
+# A) 先跑基准，看各算子达成率
+& "C:\profiling-lab\Scripts\python.exe" "C:\profiling-lab\roofline_bench.py"
+
+# B) nsys 采集（宏观：时间线 + kernel 耗时排行；无需管理员）
+& "D:\Program Files\host\target-windows-x64\nsys.exe" profile --trace=cuda,nvtx --output=C:\profiling-lab\roofline_nsys --force-overwrite=true --stats=true "C:\profiling-lab\Scripts\python.exe" "C:\profiling-lab\roofline_bench.py"
+
+# 查看方式 1：GUI 时间线（最直观；看 GPU 忙不忙、有没有 idle 用这个）
+& "D:\Program Files\host-windows-x64\nsys-ui.exe" C:\profiling-lab\roofline_nsys.nsys-rep
+
+# 查看方式 2：命令行导出各汇总表（stats --report 指定表名；--force-export 强制重新生成）
+#   2a) kernel 耗时排行（重点，找出热点 kernel）
+& "D:\Program Files\host\target-windows-x64\nsys.exe" stats --force-export=true --report cuda_gpu_kern_sum C:\profiling-lab\roofline_nsys.nsys-rep
+
+#   2b) CUDA API 调用耗时（看 CPU 侧调度开销，可选）
+& "D:\Program Files\host\target-windows-x64\nsys.exe" stats --report cuda_api_sum C:\profiling-lab\roofline_nsys.nsys-rep
+#   2c) 列出所有可用报表名（nsys 没有一次全量输出，先查有哪些表再逐个看；对应 ncu 的 --list-sections）
+& "D:\Program Files\host\target-windows-x64\nsys.exe" stats --help-reports C:\profiling-lab\roofline_nsys.nsys-rep
+
+# C) ncu 采集 fp32 GEMM（微观：GPU Speed Of Light，需管理员终端）
+#     用 --set full 采完整指标集（含 FLOP，是看 Roofline / 算 AI 的前提；basic 没存 FLOP）
+#     定位 kernel：--kernel-name "*sgemm*" 在 Windows 上经常匹配不到（报 No kernels were profiled），
+#     稳妥用 --launch-skip 2 跳过前 2 个 randn kernel，直采 GEMM（预热第 1 次）。
+& "D:\Program Files\target\windows-desktop-win7-x64\ncu.exe" --launch-skip 2 --launch-count 1 --set full -f --export "C:\profiling-lab\roofline_fp32_sgemm_full" "C:\profiling-lab\Scripts\python.exe" "C:\profiling-lab\roofline_bench.py" --kind fp32
+
+# 查看方式 1：GUI 打开完整报告（看 Occupancy / Warp State / 时间线等所有 section 最直观）
+& "D:\Program Files\host\windows-desktop-win7-x64\ncu-ui.exe" "C:\profiling-lab\roofline_fp32_sgemm_full.ncu-rep"
+
+# 查看方式 2：命令行直接打印全部内容（--import 不加 --section 就是全量输出，无需管理员）
+& "D:\Program Files\target\windows-desktop-win7-x64\ncu.exe" --import "C:\profiling-lab\roofline_fp32_sgemm_full.ncu-rep"
+
+# 查看方式 3：命令行只看某几个 section（用 --section 指定，多个 section 需分次执行）
+#   3a) 关键：GPU Speed Of Light（算力/带宽/DRAM 吞吐百分比，判断瓶颈类型）
+& "D:\Program Files\target\windows-desktop-win7-x64\ncu.exe" --import "C:\profiling-lab\roofline_fp32_sgemm_full.ncu-rep" --section SpeedOfLight
+
+#   3b) Roofline 结论（报告里给出「达到 FP32 峰值的 %」，如 "70% of FP32 peak"）
+& "D:\Program Files\target\windows-desktop-win7-x64\ncu.exe" --import "C:\profiling-lab\roofline_fp32_sgemm_full.ncu-rep" --section SpeedOfLight_RooflineChart
+
+#   3c) FLOPs（算 AI 分子）与 Bytes（算 AI 分母），手动算 AI = FLOPs ÷ Bytes
+& "D:\Program Files\target\windows-desktop-win7-x64\ncu.exe" --import "C:\profiling-lab\roofline_fp32_sgemm_full.ncu-rep" --section ComputeWorkloadAnalysis
+& "D:\Program Files\target\windows-desktop-win7-x64\ncu.exe" --import "C:\profiling-lab\roofline_fp32_sgemm_full.ncu-rep" --section MemoryWorkloadAnalysis
+
+#   3d) Occupancy（看 warp 是否填满 SM，低则找寄存器/共享内存超限原因）
+& "D:\Program Files\target\windows-desktop-win7-x64\ncu.exe" --import "C:\profiling-lab\roofline_fp32_sgemm_full.ncu-rep" --section Occupancy
+
+# 列出所有可用 section 名（确认正确的名字，如 SpeedOfLight_RooflineChart，避免用错名报错）
+& "D:\Program Files\target\windows-desktop-win7-x64\ncu.exe" --list-sections
+```
+
+> **文件怎么看**：
+> - `nsys` 采集生成 `.nsys-rep`（主报告）+ `.sqlite`（数据库）。日常看热点：查看方式 2a（`cuda_gpu_kern_sum`）看哪个 kernel 最耗时；想直观看时间线用查看方式 1（GUI）。
+> - `ncu` 采集生成 `.ncu-rep`。日常看瓶颈类型：查看方式 3a（`--section SpeedOfLight`）看 Compute/Memory 哪个接近 100%；想直观看全部用查看方式 2 或 1。
+> - **想看 Roofline（AI + roof 达成率）**：必须先 **`--set full`** 采集（`basic` 没存 FLOP 指标，算不了 AI），再用查看方式 3b（`--section SpeedOfLight_RooflineChart`）。
+
+> 工具安装路径若不同，把 `D:\Program Files\...` 换成你自己的实际路径（`nsys --version` / `ncu --version` 的输出会告诉你）。
+
+### 解读报告（跑完快速命令后怎么看）
+
+**先看 A 的输出（roofline_bench.py 的达成率表）**——它是「结果」，后面两个是「原因」：
+
+```
+算子           算术强度          实测值          理论峰值      达成率  判定
+memcpy            0.0      xxx.x GB/s      896.0 GB/s     xx.x%  memory-bound
+fp32_matmul     682.7      xx.xx TFLOPS     55.4 TFLOPS    xx.x%  compute-bound
+fp16_matmul    1365.3     xxx.xx TFLOPS    110.0 TFLOPS    xx.x%  compute-bound
+fp32_reduce       0.2      xxx.x GB/s      896.0 GB/s     xx.x%  memory-bound
+```
+
+- 达成率 **>80%**：算子跑得不错，不用深挖；
+- **某个算子明显低**（比如 memcpy 只有 30%）：这就是 profiling 的切入点，去查为什么。
+
+**再看 B'（nsys kernel 耗时排行）**——回答「哪个 kernel 最耗时」：
+
+```
+Time (%)  Total Time  Instances  Avg  Name
+  65.2    23.4 ms     1          23.4ms  cutlass_80_...sgemm_256x128  ← 热点在这里
+   ...
+```
+
+- 按 `Time (%)` 从大到小看，**第一行就是热点 kernel**；
+- 想直观看 GPU 忙不忙：`nsys-ui C:\profiling-lab\roofline_nsys.nsys-rep`（实际路径 `D:\Program Files\host-windows-x64\nsys-ui.exe`），看时间线顶部 GPU 活动条，空白 = idle；
+- 详细概念见 §3.3。
+
+**最后看 C'（ncu Speed Of Light）**——回答「热点 kernel 为什么慢，是算力还是访存瓶颈」：
+
+命令行 `ncu --import ...` 输出里重点看这一段：
+
+```
+GPU Speed Of Light Throughput:
+    Compute (SM) Throughput : 60.1%
+    Memory Throughput       : 12.4%
+```
+
+- **Compute (SM) % 高（接近 100）** → 算力瓶颈，SM 算力快用满了，是「算力屋顶」限制；
+- **Memory % 高（接近 100）** → 访存瓶颈，被带宽卡住；
+- **两个都低**（比如都 40%）→ 有「空闲」，常见原因：Occupancy 不足（warp 没填满 SM）、kernel 太短有启动/收尾开销、launch 间隙；
+- 想深入看 Occupancy：`ncu-ui C:\profiling-lab\roofline_fp32_ncu.ncu-rep`（实际路径 `D:\Program Files\host\windows-desktop-win7-x64\ncu-ui.exe`）打开 GUI 看详细 section；
+- 详细概念见 §4.3。
+
+> **一句话闭环**：A 告诉你「离屋顶差百分之几」，B 告诉你「哪个 kernel 最该查」，C 告诉你「那个 kernel 差在哪」。详细原理见 §3 和 §4。
+
+---
+
 ## 1. 安装 nsys / ncu
 
 ### 1.1 下载安装包
@@ -57,6 +183,15 @@ ncu --version
 > ```powershell
 > & "C:\Program Files\NVIDIA Corporation\Nsight Systems 2025.3\target-windows-x64\nsys.exe" --version
 > ```
+>
+> **本机实际路径速查**（CLI 与 GUI 所在目录不同，容易搞混）：
+>
+> | 工具 | 实际路径 |
+> |------|---------|
+> | `nsys.exe`（命令行） | `D:\Program Files\host\target-windows-x64\nsys.exe` |
+> | `nsys-ui.exe`（GUI） | `D:\Program Files\host-windows-x64\nsys-ui.exe` |
+> | `ncu.exe`（命令行） | `D:\Program Files\target\windows-desktop-win7-x64\ncu.exe` |
+> | `ncu-ui.exe`（GUI） | `D:\Program Files\host\windows-desktop-win7-x64\ncu-ui.exe` |
 
 ---
 
@@ -173,8 +308,11 @@ nsys profile `
 **方式 A：图形界面（推荐，直观）**
 
 ```powershell
-nsys-ui C:\profiling-lab\roofline_nsys.nsys-rep
+& "D:\Program Files\host-windows-x64\nsys-ui.exe" C:\profiling-lab\roofline_nsys.nsys-rep
 ```
+
+> `nsys-ui.exe` 在 `host-windows-x64\` 目录（与 `nsys.exe` 不在同一目录），本机实际路径见上。
+> 若 GUI 打开报告立即退出/崩溃，用「方式 B」命令行替代（功能不受影响）。
 
 会弹出 Nsight Systems GUI，时间线里能看到：
 - 顶部：GPU 各 kernel 的执行条（看 GPU 忙不忙、有没有 idle 间隙）
@@ -220,17 +358,22 @@ ncu 开销大，通常只针对**一个 kernel**分析。用 `--kernel-name` 过
 > （是 SM 没填满？还是访存拖累？）。
 
 ```powershell
-# 只跑 fp32 GEMM，并用 ncu 分析（PyTorch matmul 走 cublas 的 gemm kernel）
+# 只跑 fp32 GEMM，并用 ncu 分析（PyTorch matmul 走 cutlass 的 sgemm kernel）
 ncu `
-    --kernel-name regex:gemm `
+    --launch-skip 1 `
     --launch-count 1 `
     --set full `
     --export C:\profiling-lab\roofline_fp32_ncu `
     python C:\profiling-lab\roofline_bench.py --kind fp32
 ```
 
-> - `--kernel-name regex:gemm`：用正则匹配 kernel 名。第一次跑如果不确定 kernel 名，
->   可以先用 `--set basic` 不指定 `--kernel-name`，让它列出所有 kernel 名。
+> - `--launch-skip 1`：跳过前 1 个 kernel launch。`roofline_bench.py --kind fp32`
+>   的第一个 kernel 是 `torch.randn` 的随机数生成 kernel，第二个起才是 fp32 GEMM。
+>   跳过它就能精准采到 GEMM。
+>   **不要用 `--kernel-name regex:gemm`**：在 Windows 上 ncu 的 `--kernel-name`
+>   过滤经常失效——ncu 按 demangled 的 C++ 模板名匹配，与 nsys 显示的简化名
+>   （如 `cutlass_80_simt_sgemm_256x128_8x4`）不一致，`regex:gemm` 会匹配不到，
+>   报 `No kernels were profiled`。改用 `--launch-skip` 按 launch 顺序定位最可靠。
 > - `--launch-count 1`：只采集 1 次 launch（ncu 会重放多次取统计，1 次 launch 已能出报告）
 > - `--set full`：完整指标集。嫌慢可换 `basic`
 > - `--kind fp32`：只跑 fp32 GEMM，让 ncu 聚焦，避免把 memcpy/reduce 也采进去
@@ -238,13 +381,16 @@ ncu `
 ### 4.2 看报告
 
 ```powershell
-ncu-ui C:\profiling-lab\roofline_fp32_ncu.ncu-rep
+& "D:\Program Files\host\windows-desktop-win7-x64\ncu-ui.exe" C:\profiling-lab\roofline_fp32_ncu.ncu-rep
 ```
+
+> `ncu-ui.exe` 在 `host\windows-desktop-win7-x64\` 目录（与 `ncu.exe` 的 `target\` 目录不同），本机实际路径见上。
+> 若 GUI 打开报告立即退出/崩溃，用下方命令行替代（功能不受影响）。
 
 或命令行直接打印关键指标：
 
 ```powershell
-ncu --import C:\profiling-lab\roofline_fp32_ncu.ncu-rep
+& "D:\Program Files\target\windows-desktop-win7-x64\ncu.exe" --import C:\profiling-lab\roofline_fp32_ncu.ncu-rep
 ```
 
 ### 4.3 怎么看懂（ncu 核心概念）
@@ -281,7 +427,7 @@ ncu 报告里有几个 section，重点是前三个：
 **例子**：跑完 `roofline_bench.py` 后：
 1. 发现 `fp32_matmul` 达成率只有 60%（没到 55.4 TFLOPS 屋顶）
 2. nsys 的 `cuda_gpu_kern_sum` 确认 GEMM kernel 占主导耗时
-3. 用 ncu `--kernel-name regex:gemm` 单采 GEMM kernel
+3. 用 ncu `--launch-skip 1 --launch-count 1` 单采 GEMM kernel（跳过 randn kernel，见 §4.1）
 4. ncu 报告显示 **Compute (SM) Throughput 只有 60%**、Occupancy 偏低 → 结论：
    这个 GEMM 没吃满 SM 算力，可能是矩阵尺寸/block 配置没让 SM 满负荷，而非访存瓶颈
 
@@ -297,8 +443,10 @@ ncu 报告里有几个 section，重点是前三个：
 | `ncu` 报 `ERR_NVGPUCTRPERM` | 没以管理员运行，或驱动限制 | 用管理员 PowerShell 运行；或改注册表 `RestrictProfilingToAdminUsers=0`（见下） |
 | nsys 报告里 GPU kernel 为空 | 没加 `--trace=cuda`，或程序根本没跑 CUDA | 确认脚本真的在 GPU 上跑了（`torch.cuda.is_available()`） |
 | `nsys` / `ncu` 命令找不到 | 安装目录没进 PATH | 用完整路径，或手动加 PATH |
-| ncu 采集很慢 | `--set full` + 多个 kernel | 加 `--kernel-name` 过滤 + `--launch-count 1` |
+| ncu 采集很慢 | `--set full` + 多个 kernel | 加 `--launch-skip` 过滤 + `--launch-count 1` |
+| `ncu --kernel-name regex:gemm` 报 `No kernels were profiled` | Windows 上 ncu 按 demangled 名匹配 kernel，与 nsys 简化名不一致 | 改用 `--launch-skip 1` 跳过 randn kernel 直接采 GEMM（见 §4.1） |
 | 时间线里 GPU 全空 | 采集窗口没覆盖到计算阶段 | 确认 `--capture-range` 没配错（本教程没配，全程采） |
+| `nsys-ui` / `ncu-ui` 打开报告「闪退」，但 `Get-Process` 能看到进程在跑 | GUI 是**单实例**程序：后台已有旧实例时，新启动的实例检测到就**正常退出（exit 0）**，报告被转交给后台实例加载，窗口稍后才弹出，看起来像闪退 | 先看任务栏有没有已存在的 Nsight 窗口；或先 `Stop-Process -Name nsys-ui -Force`（ncu-ui 同理）清掉旧实例，再重新启动 |
 
 ### 关于 `ERR_NVGPUCTRPERM`（Windows 原生下的解法）
 
@@ -337,7 +485,7 @@ reg add "HKLM\SYSTEM\CurrentControlSet\Services\nvlddmkm\Global\NVTweak" `
 - [ ] `roofline_bench.py` 能在 GPU 上跑通，打印出 4 个算子的达成率表
 - [ ] 能回答：「memcpy / fp32_matmul / fp16_matmul / reduce 各自的算术强度是多少？分别命中哪个屋顶？」
 - [ ] `nsys profile ...` 能生成 `.nsys-rep`，且 `cuda_gpu_kern_sum` 报告能看到 GEMM kernel
-- [ ] `ncu --kernel-name regex:gemm ...` 能生成 `.ncu-rep`，且能看到 `GPU Speed Of Light` section
+- [ ] `ncu --launch-skip 1 ...` 能生成 `.ncu-rep`，且能看到 `GPU Speed Of Light` section
 - [ ] 能回答：「fp32_matmul 里最耗时的 kernel 是什么？它是算力瓶颈还是访存瓶颈？离算力屋顶差多少？」
 
 ---

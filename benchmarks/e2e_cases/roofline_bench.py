@@ -61,7 +61,12 @@ def bench_memcpy(n_bytes=2**30):
     a = torch.randn(n, device="cuda")
     b = torch.empty_like(a)
 
+    # 预热：WDDM 驱动空闲会深度降频（SM 可低至 210 MHz），
+    # 不预热直接测会严重低估带宽/算力。先跑几轮让 GPU boost 上来。
+    for _ in range(10):
+        b.copy_(a)
     torch.cuda.synchronize()
+
     t0 = time.perf_counter()
     b.copy_(a)  # 读 a + 写 b，共 2×n_bytes 字节
     torch.cuda.synchronize()
@@ -87,7 +92,11 @@ def bench_fp32_matmul(n=4096):
     a = torch.randn(n, n, device="cuda")
     b = torch.randn(n, n, device="cuda")
 
+    # 预热：让 GPU boost 到满频（WDDM 空闲降频会严重低估算力）
+    for _ in range(10):
+        c = a @ b
     torch.cuda.synchronize()
+
     t0 = time.perf_counter()
     c = a @ b  # FP32 GEMM
     torch.cuda.synchronize()
@@ -116,7 +125,11 @@ def bench_fp16_matmul(n=4096):
     a = torch.randn(n, n, device="cuda", dtype=torch.float16)
     b = torch.randn(n, n, device="cuda", dtype=torch.float16)
 
+    # 预热
+    for _ in range(10):
+        c = a @ b
     torch.cuda.synchronize()
+
     t0 = time.perf_counter()
     c = a @ b  # FP16 GEMM，走 Tensor Core
     torch.cuda.synchronize()
@@ -145,7 +158,11 @@ def bench_fp32_reduce(n=2**26):
     """
     a = torch.randn(n, device="cuda")
 
+    # 预热
+    for _ in range(10):
+        s = a.sum()
     torch.cuda.synchronize()
+
     t0 = time.perf_counter()
     s = a.sum()
     torch.cuda.synchronize()
