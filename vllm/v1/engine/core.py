@@ -343,7 +343,13 @@ class EngineCore:
                 "Disabling KVTransfer for this request."
             )
 
-        self.scheduler.add_request(request)
+        if not self.scheduler.add_request(request):
+            # Rejected by admission control (overload management). Notify the
+            # client immediately with an error finish reason (surfaced as
+            # HTTP 503 by the front-end) instead of leaving it hanging.
+            self._send_error_outputs_to_client(
+                [request.request_id], request.client_index
+            )
 
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""

@@ -615,4 +615,8 @@ _FINISHED_REASON_MAP = {
     RequestStatus.FINISHED_ERROR: FinishReason.ERROR,
     RequestStatus.WAITING_FOR_STREAMING_REQ: FinishReason.STOP,
     RequestStatus.FINISHED_REPETITION: FinishReason.REPETITION,
+    # Rejected by admission control (overload management). Mapped to ERROR so
+    # the front-end can surface an explicit rejection (HTTP 503) instead of
+    # leaving the client hanging until timeout.
+    RequestStatus.FINISHED_REJECTED: FinishReason.ERROR,
 }

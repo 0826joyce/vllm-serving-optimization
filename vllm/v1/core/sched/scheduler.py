@@ -353,6 +353,22 @@ class Scheduler(SchedulerInterface):
         self.short_budget_reserve_ratio: float = 0.3  # 30% for short reqs
         self.max_concurrent_long_prefill: int = 2
 
+        # ---- Long-Prefill Continuation Yield ----
+        # A "long continuation prefill" is a request already in RUNNING that is
+        # still processing its prompt (num_computed_tokens > 0) and has a large
+        # amount of prompt tokens left (> long_prefill_threshold). Without this,
+        # such requests keep occupying the token_budget across consecutive steps
+        # (chunked prefill continuation), starving waiting short requests.
+        #
+        # When enabled, we limit the number of long continuation prefills
+        # scheduled per step so the remaining budget goes to waiting short
+        # requests (interactive gold/silver), letting them jump the queue
+        # between a long document's prefill chunks.
+        self.enable_long_prefill_yield: bool = (
+            os.environ.get("VLLM_DISABLE_LONG_PREFILL_YIELD") != "1")
+        # Max number of long continuation prefills to schedule per step.
+        self.max_long_continuation_per_step: int = 1
+
         # ---- Overload Management ----
         # (a) Admission control: reject low-priority requests when queue
         #     depth or SLA violation rate is too high.
@@ -362,9 +378,9 @@ class Scheduler(SchedulerInterface):
         #     first to salvage resources.
         self.enable_overload_management: bool = (
             os.environ.get("VLLM_DISABLE_OVERLOAD_MGMT") != "1")
-        self.max_queue_depth: int = 100
-        self._sla_violation_window: deque[bool] = deque(maxlen=50)
-        self.overload_violation_threshold: float = 0.5  # 50% → reject low
+        self.max_queue_depth: int = 40
+        self._sla_violation_window: deque[bool] = deque(maxlen=25)
+        self.overload_violation_threshold: float = 0.25  # 25% → reject low
         self.enable_deadline_aware_scheduling: bool = (
             self.enable_overload_management
             and os.environ.get("VLLM_DISABLE_DEADLINE_AWARE") != "1")
@@ -483,6 +499,10 @@ class Scheduler(SchedulerInterface):
 
         # First, schedule the RUNNING requests.
         req_index = 0
+        # Long-Prefill Continuation Yield: count of long continuation prefills
+        # scheduled in this step, used to throttle them so waiting short
+        # requests can interleave between a long document's prefill chunks.
+        long_continuation_count = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
 
@@ -509,6 +529,31 @@ class Scheduler(SchedulerInterface):
             )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+
+            # ---- Long-Prefill Continuation Yield ----
+            # Identify a "long continuation prefill": a RUNNING request that has
+            # already computed part of its prompt (num_computed_tokens > 0) and
+            # still has a large amount of prompt tokens left. Such requests would
+            # otherwise keep consuming the token_budget across consecutive steps
+            # (chunked prefill continuation), starving waiting short requests.
+            is_long_continuation = (
+                self.enable_long_prefill_yield
+                and request.num_computed_tokens > 0
+                and num_new_tokens > self.long_prefill_threshold
+            )
+            if is_long_continuation:
+                if (
+                    long_continuation_count
+                    >= self.max_long_continuation_per_step
+                ):
+                    # Throttle: defer this continuation to leave budget for
+                    # waiting short requests. `continue` (not `break`) so that
+                    # lower-priority RUNNING requests (e.g. short decode) can
+                    # still be scheduled this step.
+                    req_index += 1
+                    continue
+                long_continuation_count += 1
+
             num_new_tokens = min(num_new_tokens, token_budget)
 
             # Make sure the input position does not exceed the max model len.
@@ -1641,6 +1686,12 @@ class Scheduler(SchedulerInterface):
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
                 if finished:
+                    # ---- Overload Management: record SLA violation ----
+                    # Feed the sliding window used by admission control so that
+                    # the violation-rate gate can actually trigger under load.
+                    if self.enable_overload_management:
+                        self._sla_violation_window.append(
+                            request.is_sla_violated())
                     kv_transfer_params = self._free_request(request)
 
                 if status_before_stop == RequestStatus.RUNNING:
@@ -1941,7 +1992,14 @@ class Scheduler(SchedulerInterface):
         """Returns (num_running_reqs, num_waiting_reqs)."""
         return len(self.running), len(self.waiting) + len(self.skipped_waiting)
 
-    def add_request(self, request: Request) -> None:
+    def add_request(self, request: Request) -> bool:
+        """Add a request to the scheduler.
+
+        Returns True if the request was admitted, False if it was rejected by
+        admission control (overload management). Rejected requests are finished
+        immediately with ``FINISHED_REJECTED`` status so the caller can notify
+        the client (HTTP 503) instead of leaving it hanging until timeout.
+        """
         existing = self.requests.get(request.request_id)
         if existing is not None:
             update = StreamingUpdate.from_request(request)
@@ -1955,6 +2013,7 @@ class Scheduler(SchedulerInterface):
             else:
                 # Streaming-input session finished.
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+            return True
         else:
             # ---- Overload Management: Admission Control ----
             # Under overload, reject low-priority requests to protect
@@ -1965,13 +2024,18 @@ class Scheduler(SchedulerInterface):
             ):
                 request.status = RequestStatus.FINISHED_REJECTED
                 self.requests[request.request_id] = request
-                return
+                # Free immediately: adds the request id to the finished set and
+                # removes it from self.requests, so it does not leak. The caller
+                # is responsible for notifying the client of the rejection.
+                self._free_request(request)
+                return False
             if request.resumable:
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
+            return True
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
@@ -2075,15 +2139,15 @@ class Scheduler(SchedulerInterface):
 
         High-priority requests are never rejected by admission control
         and are given scheduling preference.
+
+        Admission control protects *Gold* traffic only: a request is
+        high-priority if and only if its explicit API priority is negative
+        (i.e. ``priority < 0``). Silver (priority == 0) and Bronze
+        (priority > 0) requests are subject to admission control so that,
+        under overload, they can be rejected to protect Gold SLAs.
         """
-        # By MLFQ level (new requests always start at L0).
-        if self.enable_mlfq and request.mlfq_level <= 1:
-            return True
-        # By explicit API priority.
+        # By explicit API priority (Gold tier). Lower value = higher priority.
         if request.priority < 0:
-            return True
-        # By short prompt (interactive traffic).
-        if request.num_prompt_tokens < Request.SHORT_PROMPT_THRESHOLD:
             return True
         return False
 

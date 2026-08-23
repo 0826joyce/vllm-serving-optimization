@@ -154,54 +154,145 @@ BRONZE_SYSTEM_PROMPT = (
     "你是文档分析助手。请仔细阅读提供的文档，给出准确全面的分析。"
 )
 
-LONG_DOCUMENTS = [
-    (
+# 长文档的目标长度：约 5000 token，明显超过调度器的
+# long_prefill_threshold（1024），确保「长文档 Prefill」这一负载特征真正成立，
+# 并能触发 chunked prefill 的多块调度（max_num_batched_tokens=2048 下需 3 块）。
+LONG_DOC_TARGET_TOKENS = 5000
+
+# 每篇长文档的「骨架」：开头是真实主题，后续用程序化段落填充到目标长度。
+# 填充段落复用真实的技术/业务细节，而非无意义重复字符，以贴近真实 RAG 场景。
+_LONG_DOC_SKELETONS = [
+    # 文档 0：云原生架构迁移调研报告
+    [
         "以下是云原生架构迁移调研报告，请分析关键风险：\n\n"
-        "# 云原生迁移报告\n\n## 背景\n"
-        "当前单体架构面临：部署周期2周，扩缩容困难，故障影响全站。\n\n"
-        "## 目标架构\nKubernetes + Istio + ArgoCD + Prometheus\n\n"
-        "## 拆分策略\n按DDD拆分为：用户服务、订单服务、商品服务、搜索服务、通知服务\n\n"
-        "## 迁移方案\n采用Strangler Fig Pattern：\n"
-        "- 第一阶段：用户服务（低风险）\n- 第二阶段：订单+商品（分布式事务Saga）\n"
-        "- 第三阶段：搜索+通知（Kafka消息队列）\n- 第四阶段：下线旧系统\n\n"
-        "## 风险\n- 数据一致性复杂\n- 网络延迟增加\n- 运维复杂度提升\n- 团队技能缺口\n\n"
-        "请分析最大技术风险及缓解措施。"
-    ),
-    (
-        "以下是AI编程产品PRD，请分析对推理服务的性能挑战：\n\n"
-        "# AI Code Assistant PRD\n\n## 核心功能\n"
-        "F1：智能补全（TTFT<200ms，多行）\nF2：代码解释（选中代码插入注释）\n"
-        "F3：重构建议（代码异味检测+一键重构）\nF4：测试生成（pytest/jest/JUnit）\n"
-        "F5：文档生成（docstring/JSDoc/README）\n\n"
-        "## 技术架构\n前端IDE插件 → 请求路由 → vLLM集群(A100) → Redis缓存\n"
-        "模型：CodeLlama 34B\n\n"
-        "## 性能指标\n补全TTFT<200ms QPS>100 | 解释TTFT<1s QPS>20 | 测试<3s QPS>10\n\n"
-        "请分析核心性能挑战。"
-    ),
-    (
-        "以下是SaaS服务协议关键条款，请审查对我方不利的条款：\n\n"
-        "# SaaS服务协议\n\n## 费用\n按token计费：输入$0.01/1K，输出$0.03/1K\n"
-        "微调按GPU小时：$2.5/h(A100)\n逾期每日0.05%滞纳金\n\n"
-        "## SLA\n月可用性≥99.9%\n未达标赔偿：99-99.9%赔10%，95-99%赔30%，<95%赔100%\n"
-        "排除：客户原因/不可抗力/计划维护\n\n"
-        "## 数据\n不用于训练，AES-256加密，合同终止30天删除\n\n"
-        "## 知识产权\n输入归客户，输出归客户，平台归服务商\n\n"
-        "## 责任限制\n间接损失不赔，最大赔偿=12个月费用\n\n"
-        "## 期限\n1年自动续约，需提前90天通知不续约\n\n"
-        "请指出对乙方不利的条款并给出修改建议。"
-    ),
-    (
-        "以下是Q1项目评审会议纪要，请提取关键决策和Action Items：\n\n"
-        "# 项目评审会议纪要\n日期：2025-03-15 时长2h\n\n"
-        "## 进度回顾\n项目A(用户增长)完成80% | 项目B(支付重构)延期2周 | 项目C(推荐v2)提前完成CTR+15%\n"
-        "决策：从C抽调2人支援B\n\n## 稳定性\nQ1发生3次P1故障\n"
-        "目标Q2零P1。措施：上线前压测+混沌工程\n\n"
-        "## Q2规划\nP0：AI助手集成+安全合规 | P1：国际化+性能优化\n"
-        "资源：研发40人分配15AI/10国际化/5性能/10安全\n\n"
-        "## 技术债务\n旧API三版本并行，TS迁移30%，测试覆盖率后端60%前端25%\n"
-        "决策：Q2投入20%时间处理技术债务\n\n请按优先级排序所有决策和Action Items。"
-    ),
+        "# 云原生架构迁移调研报告\n\n## 一、背景与现状\n"
+        "当前系统采用传统单体架构，部署周期长达两周，扩缩容依赖人工审批，"
+        "故障影响范围覆盖全站。核心痛点包括：发布频率低、资源利用率不足、"
+        "故障定位困难、团队协作效率低下。\n\n",
+        "## 二、目标架构设计\n"
+        "目标采用 Kubernetes 作为容器编排平台，Istio 提供服务网格能力，"
+        "ArgoCD 实现 GitOps 持续交付，Prometheus 与 Grafana 构建可观测体系。"
+        "整体遵循微服务拆分原则，将单体拆分为多个独立可部署的服务单元。\n\n",
+        "## 三、拆分策略\n"
+        "按领域驱动设计（DDD）拆分为用户服务、订单服务、商品服务、搜索服务、"
+        "通知服务五个核心领域。每个领域独立数据库、独立发布节奏、独立扩容策略。"
+        "领域间通过事件驱动解耦，避免强依赖。\n\n",
+        "## 四、迁移方案\n"
+        "采用 Strangler Fig Pattern（绞杀者模式）渐进式迁移：第一阶段迁移用户服务"
+        "（低风险），第二阶段迁移订单与商品服务（分布式事务 Saga），第三阶段迁移"
+        "搜索与通知服务（Kafka 消息队列），第四阶段下线旧系统。\n\n",
+        "## 五、风险分析\n"
+        "主要风险包括：分布式数据一致性复杂、跨服务网络延迟增加、运维复杂度"
+        "显著提升、团队容器化技能存在缺口、监控告警体系需重构。\n\n",
+        "## 六、附录：架构演进时间线\n",
+    ],
+    # 文档 1：AI 编程产品 PRD
+    [
+        "以下是 AI 编程助手产品 PRD，请分析对推理服务的性能挑战：\n\n"
+        "# AI Code Assistant PRD\n\n## 一、核心功能\n"
+        "F1 智能补全（TTFT<200ms，支持多行）、F2 代码解释（选中代码插入注释）、"
+        "F3 重构建议（代码异味检测与一键重构）、F4 测试生成（pytest/jest/JUnit）、"
+        "F5 文档生成（docstring/JSDoc/README）。\n\n",
+        "## 二、技术架构\n"
+        "前端 IDE 插件经请求路由分发至 vLLM 集群，Redis 缓存热点结果。"
+        "模型采用 CodeLlama 34B，推理框架 vLLM，支持前缀缓存加速。\n\n",
+        "## 三、性能指标\n"
+        "补全 TTFT<200ms 且 QPS>100，代码解释 TTFT<1s 且 QPS>20，"
+        "测试生成 TTFT<3s 且 QPS>10。首 token 延迟是核心体验指标。\n\n",
+        "## 四、部署与扩缩容\n"
+        "采用多副本部署，按 QPS 弹性扩缩容，GPU 资源池化调度。"
+        "冷启动需预热模型，避免首请求高延迟。\n\n",
+        "## 五、挑战与风险\n"
+        "长上下文代码理解开销大、多租户并发争抢 GPU、缓存命中率波动、"
+        "代码安全合规审查需额外开销。\n\n",
+        "## 六、附录：功能需求明细\n",
+    ],
+    # 文档 2：SaaS 服务协议审查
+    [
+        "以下是 SaaS 服务协议关键条款，请审查对我方不利的条款：\n\n"
+        "# SaaS 服务协议\n\n## 一、费用条款\n"
+        "按 token 计费：输入 $0.01/1K，输出 $0.03/1K。微调按 GPU 小时计费"
+        " $2.5/h。逾期付款每日收取 0.05% 滞纳金。\n\n",
+        "## 二、SLA 条款\n"
+        "月度可用性不低于 99.9%。未达标赔偿：99%-99.9% 赔 10%，95%-99% 赔 30%，"
+        "低于 95% 赔 100%。排除情形包括客户原因、不可抗力、计划内维护。\n\n",
+        "## 三、数据与隐私\n"
+        "客户数据不用于训练模型，采用 AES-256 加密存储，合同终止后 30 天内删除。"
+        "数据传输全程 TLS 加密。\n\n",
+        "## 四、知识产权\n"
+        "输入内容归客户所有，输出内容归客户所有，平台本身归服务商所有。\n\n",
+        "## 五、责任限制\n"
+        "间接损失不予赔偿，最大赔偿额为 12 个月服务费用。\n\n",
+        "## 六、期限与续约\n"
+        "合同期限 1 年，自动续约，需提前 90 天书面通知方可终止。\n\n",
+        "## 七、附录：完整条款清单\n",
+    ],
+    # 文档 3：项目评审会议纪要
+    [
+        "以下是 Q1 项目评审会议纪要，请提取关键决策和 Action Items：\n\n"
+        "# 项目评审会议纪要\n日期：2025-03-15 时长 2 小时\n\n## 一、进度回顾\n"
+        "项目 A（用户增长）完成 80%，项目 B（支付重构）延期 2 周，项目 C"
+        "（推荐 v2）提前完成且 CTR 提升 15%。决策：从项目 C 抽调 2 人支援项目 B。\n\n",
+        "## 二、稳定性\n"
+        "Q1 发生 3 次 P1 故障。Q2 目标为零 P1。措施：上线前压测 + 混沌工程演练。\n\n",
+        "## 三、Q2 规划\n"
+        "P0：AI 助手集成与安全合规；P1：国际化与性能优化。研发 40 人分配："
+        "AI 15 人、国际化 10 人、性能 5 人、安全 10 人。\n\n",
+        "## 四、技术债务\n"
+        "旧 API 三版本并行，TypeScript 迁移进度 30%，测试覆盖率后端 60%、前端 25%。"
+        "决策：Q2 投入 20% 时间处理技术债务。\n\n",
+        "## 五、附录：完整决策记录\n",
+    ],
 ]
+
+# 用于填充长文档的段落模板（真实技术细节，避免无意义重复）
+_LONG_DOC_FILLER = [
+    "本节详细描述了系统在真实生产环境中的运行特征。通过长期观测可以发现，"
+    "流量呈现明显的昼夜波动，峰值时段集中在工作日上午十点到下午四点。"
+    "在高峰期，系统的并发请求数量会达到平峰期的三到五倍，这对资源调度"
+    "提出了极高的要求。合理的容量规划与弹性伸缩策略能够有效应对这种波动。\n\n",
+    "从工程实践的角度来看，模块边界的清晰划分是保障系统可维护性的基础。"
+    "每个模块应当具备明确的输入输出契约，模块之间通过稳定的接口通信。"
+    "这种设计使得团队可以并行开发不同模块，同时降低回归测试的成本。"
+    "版本管理上，建议采用语义化版本号，并保持向后兼容。\n\n",
+    "性能优化是一个持续迭代的过程。首先需要建立完善的监控体系，覆盖请求"
+    "延迟、吞吐量、错误率、资源利用率等核心指标。基于监控数据进行瓶颈分析，"
+    "定位最耗时的环节。优化的手段包括缓存、异步化、批处理、算法改进等。"
+    "每一次优化都需要通过压测验证效果，并回滚不达预期的改动。\n\n",
+    "可靠性设计需要从多个维度综合考量。故障隔离通过熔断器与限流实现，"
+    "避免单点故障扩散。数据可靠性依赖多副本与定期备份。系统的可观测性"
+    "依赖结构化日志、分布式追踪与指标监控三者的有机结合。应急预案应当"
+    "定期演练，确保团队在真实故障发生时能够快速响应。\n\n",
+    "安全合规是现代系统的底线要求。访问控制遵循最小权限原则，敏感数据"
+    "需要加密存储与传输。审计日志应当完整记录关键操作，满足合规要求。"
+    "安全测试应当纳入持续集成流程，定期进行漏洞扫描与渗透测试。"
+    "第三方依赖需要及时更新，修复已知安全漏洞。\n\n",
+]
+
+
+def _build_long_documents() -> list[str]:
+    """构造目标长度的长文档（约 LONG_DOC_TARGET_TOKENS token）。
+
+    每篇文档由「真实主题骨架 + 程序化填充段落」构成，填充段落循环拼接
+    直到达到目标长度。这样既保证 token 数可控（≈5000），又贴近真实 RAG 场景，
+    而非用无意义的重复字符凑数。
+    """
+    docs = []
+    for skeleton in _LONG_DOC_SKELETONS:
+        doc = "".join(skeleton)
+        # 循环追加填充段落，直到接近目标 token 数。
+        # 中文约 1 token/字（Qwen tokenizer 对中文约 1.5-2 字/token），
+        # 这里按保守估计填充，后续用 tokenizer 校准。
+        filler_idx = 0
+        # 追加足够多的填充段落（每个填充段约 110 中文字 ≈ 80 token）
+        while filler_idx < 62:  # 62 × ~80 token ≈ 4960 token，配合骨架 ≈ 5200
+            doc += _LONG_DOC_FILLER[filler_idx % len(_LONG_DOC_FILLER)]
+            filler_idx += 1
+        docs.append(doc)
+    return docs
+
+
+LONG_DOCUMENTS = _build_long_documents()
 
 
 # ============================================================
@@ -484,6 +575,7 @@ async def gold_a_generator(
     all_records: List[RequestRecord],
     lock: asyncio.Lock,
     deploy_mode: str = "single",
+    qps_scale: float = 1.0,
 ):
     """Gold-A: 金融客服，Phase 2 做 Prompt 切换，Phase 3/5 暴增"""
     count = 0
@@ -501,6 +593,7 @@ async def gold_a_generator(
             qps = 48.0   # 过载
         else:
             qps = 8.0
+        qps *= qps_scale
 
         # 确定 System Prompt 版本
         if phase == "phase_1":
@@ -632,6 +725,7 @@ async def silver_generator(
     all_records: List[RequestRecord],
     lock: asyncio.Lock,
     deploy_mode: str = "single",
+    qps_scale: float = 1.0,
 ):
     """Silver 租户：稳定短对话"""
     count = 0
@@ -642,7 +736,7 @@ async def silver_generator(
     while time.monotonic() < end:
         elapsed = time.monotonic() - start_time
         phase = get_phase(elapsed)
-        qps = 12.0 if phase == "phase_5" else 8.0  # Phase 5 略增
+        qps = (12.0 if phase == "phase_5" else 8.0) * qps_scale  # Phase 5 略增
 
         record = RequestRecord(
             request_id=f"{tid}_{count}",
@@ -675,6 +769,8 @@ async def bronze_generator(
     all_records: List[RequestRecord],
     lock: asyncio.Lock,
     deploy_mode: str = "single",
+    qps_scale: float = 1.0,
+    bronze_scale: float = 1.0,
 ):
     """Bronze 租户：长文档 RAG，Phase 4/5 暴增"""
     count = 0
@@ -691,6 +787,8 @@ async def bronze_generator(
             qps = 15.0    # 过载
         else:
             qps = 3.0
+        # bronze_scale 允许独立缩放长文档负载，用于定位"长文档干扰边界"
+        qps *= qps_scale * bronze_scale
 
         record = RequestRecord(
             request_id=f"{tid}_{count}",
@@ -1163,7 +1261,8 @@ async def run_workload(args):
             tasks.append(asyncio.create_task(
                 gold_a_generator(session, url, args.model,
                                  start_time, args.duration,
-                                 all_records, lock, mode)
+                                 all_records, lock, mode,
+                                 args.qps_scale)
             ))
 
             # Gold-B: 代码补全
@@ -1178,7 +1277,8 @@ async def run_workload(args):
                 tasks.append(asyncio.create_task(
                     silver_generator(session, url, args.model, i,
                                      start_time, args.duration,
-                                     all_records, lock, mode)
+                                     all_records, lock, mode,
+                                     args.qps_scale)
                 ))
 
             # Bronze × 2
@@ -1186,7 +1286,9 @@ async def run_workload(args):
                 tasks.append(asyncio.create_task(
                     bronze_generator(session, url, args.model, i,
                                      start_time, args.duration,
-                                     all_records, lock, mode)
+                                     all_records, lock, mode,
+                                     args.qps_scale,
+                                     args.bronze_qps_scale)
                 ))
 
             # 实时监控
@@ -1284,6 +1386,21 @@ def main():
                         default="results/combined/",
                         help="结果输出目录")
     parser.add_argument("--seed", type=int, default=42)
+
+    # ---- 负载缩放（用于负载扫描，定位优化方案的有效边界）----
+    parser.add_argument(
+        "--qps-scale",
+        type=float,
+        default=1.0,
+        help="全局 QPS 缩放系数（所有租户所有阶段），默认 1.0",
+    )
+    parser.add_argument(
+        "--bronze-qps-scale",
+        type=float,
+        default=1.0,
+        help="额外只缩放 Bronze 长文档 QPS（与 --qps-scale 相乘），"
+             "用于扫描长文档干扰的边界，默认 1.0",
+    )
 
     # ---- 部署模式 ----
     parser.add_argument(
