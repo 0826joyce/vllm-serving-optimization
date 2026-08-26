@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -179,6 +180,7 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
 )
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
+from vllm.v1.spec_decode.adaptive_suffix_proposer import AdaptiveSuffixProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
@@ -528,7 +530,21 @@ class GPUModelRunner(
             if self.speculative_config.method == "ngram":
                 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
-                self.drafter = NgramProposer(self.vllm_config)
+                # Optional self-developed proposers (scheduling optimization).
+                # VLLM_SPEC_PROPOSER=adaptive selects AdaptiveSuffixProposer
+                # (multi-candidate scoring + acceptance feedback).
+                spec_proposer = os.environ.get("VLLM_SPEC_PROPOSER", "ngram").lower()
+                if spec_proposer == "adaptive":
+                    from vllm.v1.spec_decode.adaptive_suffix_proposer import (
+                        AdaptiveSuffixProposer,
+                    )
+
+                    logger.info(
+                        "Using AdaptiveSuffixProposer for speculative decoding."
+                    )
+                    self.drafter = AdaptiveSuffixProposer(self.vllm_config)
+                else:
+                    self.drafter = NgramProposer(self.vllm_config)
             elif self.speculative_config.uses_draft_model():
                 self.drafter = DraftModelProposer(
                     vllm_config=self.vllm_config,
@@ -1083,6 +1099,13 @@ class GPUModelRunner(
         # and handling the second as a new request.
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
+            # Clean up per-request SAM state if using the self-developed
+            # AdaptiveSuffixProposer (scheduling optimization).
+            if (
+                self.use_spec_decode
+                and isinstance(self.drafter, AdaptiveSuffixProposer)
+            ):
+                self.drafter.remove_request(req_id)
 
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
@@ -4519,16 +4542,35 @@ class GPUModelRunner(
         spec_config = self.speculative_config
         assert spec_config is not None
         if spec_config.method == "ngram":
+            from vllm.v1.spec_decode.adaptive_suffix_proposer import (
+                AdaptiveSuffixProposer,
+            )
             from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
             assert isinstance(sampled_token_ids, list)
-            assert isinstance(self.drafter, NgramProposer)
-            draft_token_ids = self.drafter.propose(
-                sampled_token_ids,
-                self.input_batch.num_tokens_no_spec,
-                self.input_batch.token_ids_cpu,
-                slot_mappings=slot_mappings,
-            )
+            assert isinstance(self.drafter, (NgramProposer, AdaptiveSuffixProposer))
+            if isinstance(self.drafter, AdaptiveSuffixProposer):
+                # Feed acceptance feedback before proposing (per request).
+                for i, sampled_ids in enumerate(sampled_token_ids):
+                    if len(sampled_ids) > 1:
+                        req_id = self.input_batch.req_ids[i]
+                        self.drafter.update_acceptance(
+                            req_id, num_accepted=len(sampled_ids) - 1
+                        )
+                draft_token_ids = self.drafter.propose(
+                    sampled_token_ids,
+                    self.input_batch.num_tokens_no_spec,
+                    self.input_batch.token_ids_cpu,
+                    slot_mappings=slot_mappings,
+                    req_ids=self.input_batch.req_ids,
+                )
+            else:
+                draft_token_ids = self.drafter.propose(
+                    sampled_token_ids,
+                    self.input_batch.num_tokens_no_spec,
+                    self.input_batch.token_ids_cpu,
+                    slot_mappings=slot_mappings,
+                )
         elif spec_config.use_ngram_gpu():
             assert isinstance(self.drafter, NgramProposerGPU)
             (
