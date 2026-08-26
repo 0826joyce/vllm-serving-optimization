@@ -1102,7 +1102,7 @@ class GPUModelRunner(
             # Clean up per-request SAM state if using the self-developed
             # AdaptiveSuffixProposer (scheduling optimization).
             if (
-                self.use_spec_decode
+                self.speculative_config is not None
                 and isinstance(self.drafter, AdaptiveSuffixProposer)
             ):
                 self.drafter.remove_request(req_id)
