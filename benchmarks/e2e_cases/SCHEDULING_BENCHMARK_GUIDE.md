@@ -1270,6 +1270,89 @@ ls results/baseline_fcfs/abs_bench/ results/optimized_qos/abs_bench/
 > 测试环境：RTX 5070 Ti（Blackwell，sm_120），Qwen2.5-1.5B-Instruct，
 > `--enforce-eager`，单实例，5 阶段混合负载（Phase 1-5，各 60s）。
 
+### 7.0 汇总：必须的参数配置与测试评估内容（先看这个）
+
+> 本节先给结论——经过 §7.1-§7.16 整条验证链的实测，反推出"参数必须怎么配"和"测试评估的是什么"。详细推导见后续小节，本节用于快速上手与避坑。
+
+#### 7.0.1 必须的参数配置（踩坑后固化）
+
+以下配置由 §7.2-§7.16 的实测结论反推得出，**任意一项偏离都会导致结果失真或结论错误**：
+
+**A. 服务端启动参数（优化版 B 轮 / C 轮）**
+
+| 参数 | 必须值 | 不能改的原因 / 踩坑来源 |
+|------|--------|------------------------|
+| `--scheduling-policy` | `priority`（优化版）/ `fcfs`（基线） | 唯一变量，决定 QoS 是否生效 |
+| `--model` | `Qwen/Qwen2.5-1.5B-Instruct` | A/B 两轮必须同一模型，控制变量 |
+| `--max-model-len` | `8192` | 两轮一致；过低会截断长文档，影响 Phase 4 |
+| `--enable-prefix-caching` | 两轮都开 | 控制变量，隔离"调度优化"而非"有没有缓存" |
+| `--gpu-memory-utilization` | `0.85` | 两轮一致 |
+| **`--enforce-eager`** | **必须去掉**（§7.14） | ⚠️ 最大坑：eager 禁用 CUDA graph，prefill 慢 60-100 倍，Phase 3 就 100% 违约，会得出错误结论 |
+| `--max-num-seqs`（`max_num_seqs`） | 默认 256，**不要降到 128**（§7.14） | 降到 128 反而加剧排队，256 能容纳更多短请求快速 decode |
+| `--max-num-batched-tokens` | `2048` | 决定长文档 chunked prefill 的块数（4800 token 需 3 块） |
+
+**B. 准入控制阈值（优化版，§7.6 固化）**
+
+| 参数 | 必须值 | 原默认值 | 调整理由 |
+|------|--------|---------|---------|
+| `max_queue_depth` | `40` | 100 | 过高导致准入控制从未触发（§7.4） |
+| `overload_violation_threshold` | `0.25` | 0.5 | 更早识别过载 |
+| `_sla_violation_window` maxlen | `25` | 50 | 更灵敏反映近期违约率 |
+| `_is_high_priority_request` | 仅 `priority < 0`（gold） | 含"短 prompt 即高优" | 旧判定让准入控制形同虚设（§7.6） |
+
+**C. 压测参数（workload.py）**
+
+| 参数 | 必须值 | 踩坑来源 |
+|------|--------|---------|
+| `--seed` | `42` | A/B 必须相同，保证流量可复现 |
+| `--duration` | `300` | 5 个 Phase × 60s |
+| `--bronze-qps-scale` | **必须显式设置**（§7.15-7.16） | ⚠️ 默认 1.0 时 4800 token × 10 QPS = 48000 tok/s，超硬件 16.7 倍，物理无解；临界过载区间用 `0.2~0.25` 才能测出优化效果 |
+| 长文档数据 | **~4800 token**（§7.11 修正后） | 旧数据 230 token 名不副实，掩盖了长文档 Prefill 的真实破坏力 |
+
+**D. 基线版（A 轮）必须显式关闭所有优化**
+
+```bash
+VLLM_DISABLE_MLFQ=1 VLLM_DISABLE_RATE_LIMIT=1 VLLM_DISABLE_TENANT_ISO=1 \
+VLLM_DISABLE_OVERLOAD_MGMT=1 VLLM_DISABLE_DEADLINE_AWARE=1 \
+--scheduling-policy fcfs
+```
+> 少关一个会让基线"偷偷"带了优化，A/B 对比失效。
+
+#### 7.0.2 测试评估的是什么（评估维度与判据）
+
+本测试用**三层证据**交叉验证，缺一不可：
+
+| 层 | 工具 | 评估的核心问题 | 关键指标 | 判据 |
+|----|------|--------------|---------|------|
+| **客户端·公平性** | `workload.py` | 优化是否改善了**低优租户**的 SLA？是否保护了高优？ | 按 tier × phase 的违约率、完成请求数、拒绝率 | silver/bronze 违约率 ↓53-56pp 为有效；gold 违约率不变则符合预期（物理无解） |
+| **客户端·绝对性能** | `vllm bench serve` | 优化有没有**牺牲整体吞吐**？ | 吞吐(req/s, tok/s)、P99 TTFT/TPOT/ITL/E2EL、失败请求数 | B 轮吞吐与 A 轮 ±5% 内为安全；>10% 退化为过度优化 |
+| **服务端·内部状态** | Prometheus + Grafana | 调度器内部行为是否符合预期？ | 队列长度、KV Cache 使用率、抢占次数、排队时间 P99、Prefill/Decode 耗时 | 优化版 waiting 队列更短、KV Cache 更平滑、抢占 SLA 感知 |
+
+**评估的三个判据层级：**
+
+1. **优化是否有效**：silver/bronze 违约率显著下降（临界过载区间内）
+2. **优化是否安全**：绝对吞吐不退化（±5%），TPOT/ITL 不恶化
+3. **优化边界在哪**：轻载无效（无优化空间）、严重过载无效（物理算力耗尽），**临界过载（bronze QPS 0.2-0.5）是有效区间**
+
+#### 7.0.3 评估时必须同时看的三个率（避免幸存者偏差）
+
+§7.10 / §7.16 暴露的关键陷阱：**只看违约率会被准入控制欺骗**——拒绝低优请求会让"完成的"请求违约率下降，但这是幸存者偏差。完整评估必须同时看：
+
+| 指标 | 含义 | 为什么不能只看违约率 |
+|------|------|---------------------|
+| **违约率** | 完成请求中 SLA 超标的比例 | 被拒请求不计入，会人为降低 |
+| **拒绝率** | 被准入控制拒绝（503）的比例 | 优化"保护"silver 的机制本质是拒绝，不是更快 |
+| **完成率** | 实际完成 / 总发出 | 反映用户实际体验（被拒=用户拿不到结果） |
+
+> 三者结合才能说清楚：优化是"让低优更快"还是"让低优被拒"——本项目结论是后者（§7.10 发现 3）。
+
+#### 7.0.4 一句话总结
+
+> **参数**：去掉 `--enforce-eager` + 用 `--bronze-qps-scale` 控负载到临界过载 + 准入阈值收紧到 40/0.25/25，是跑出有效结论的硬前提。
+> **评估**：三层证据（公平性 + 绝对性能 + 服务端状态）× 三个率（违约 + 拒绝 + 完成），才能说清楚"优化有效但有边界、保护的是拒绝而非加速"。
+
+---
+
 ### 7.1 代码移植背景（重要）
 
 原始优化代码基于**旧版 vLLM 调度器结构**（`vllm/v1/core/scheduler.py` 单文件），
@@ -1831,6 +1914,88 @@ silver 用户拿到的不是"更快"，而是"被拒绝"。这需要业务侧决
 
 核心结论稳定且可复现：**调度优化（priority + 准入控制）能有效保护 silver/bronze 租户
 （-53~-56pp 违约率），但无法保护 gold（最高优先级自身过载，物理无解）。**
+
+### 7.17 指标覆盖度自检：已验证 vs 尚缺（重要）
+
+> 本节显式记录一个**证据链缺口**：§7 整条验证链的实测数据，**几乎全部集中在「违约率 / 拒绝率 / 完成请求数」**，
+> 而方法论（§0、§4、§扩展 0）设计的「吞吐、TPOT、ITL」等绝对性能指标**基本没有真正采集用于 A/B 对比**。
+> 结论"调度优化保护了 silver/bronze"目前**只有公平性一条腿**，缺「整体吞吐是否被牺牲」这条腿。
+
+#### 7.17.1 已验证的指标（§7 有实测 A/B 数据）
+
+| 指标 | 来源 | 在 §7 的落点 | 状态 |
+|------|------|-------------|------|
+| 分阶段 / 分租户**违约率** | `workload.py` | §7.2/§7.6/§7.9/§7.10/§7.12/§7.16 | ✅ 充分 |
+| 准入**拒绝次数 / 拒绝率** | `workload.py` + scheduler 日志 | §7.6（6038 次）/§7.16 | ✅ 充分 |
+| **完成请求数** | `workload.py` | §7.10/§7.16 | ✅ 有（用于揭示"保护=拒绝"） |
+| **P99 TTFT**（零星） | `workload.py` | §7.2（如 94072ms）/§7.9（68ms） | ⚠️ 仅个别点，未系统 A/B |
+
+#### 7.17.2 尚缺的指标（设计了但 §7 未执行）
+
+| 指标 | 应有来源 | 为什么重要 | 当前状态 |
+|------|---------|-----------|---------|
+| **吞吐（req/s、tok/s）** | `vllm bench serve`（§扩展 0） | reviewer 必问："优化有没有牺牲整体吞吐？"（§扩展 0 原话） | ❌ 未执行（§7.5 待办 `[ ]` 未勾选） |
+| **P99 TPOT** | `vllm bench serve` | Token 限速是否过度拖慢 Decode | ❌ 无任何实测 |
+| **P99 ITL** | `vllm bench serve` | 抢占是否影响生成流畅度 | ❌ 无任何实测 |
+| **P99 E2EL**（系统性） | `vllm bench serve` | 端到端总延迟的 A/B 对比 | ❌ 无系统数据 |
+| 服务端**排队时间 / Prefill-Decode 耗时** | Prometheus+Grafana（§扩展 -1） | 坐实瓶颈在排队还是 Prefill | ⚠️ 仅 §8 定性提及，无 A/B 截图归档 |
+
+#### 7.17.3 缺口的影响
+
+1. **"保护 = 拒绝" 的代价未被量化**：§7.16 已证明优化靠**拒绝大量 silver/bronze** 来降违约率
+   （silver 拒 87.6%、bronze 拒 75%）。被拒请求不产出 token，**必然影响整体有效吞吐**——
+   但没有吞吐数据，无法回答"这个保护值不值"。
+2. **无法排除"优化引入了 Decode 退化"**：QoS/MLFQ/Token 限速可能增加调度开销或抢占，
+   理应用 TPOT/ITL 验证"Decode 不受影响"（§0.3 / §7.0.2 判据 ±5%），但从未实测。
+3. **判据悬空**：§7.0.2 定了"B 轮吞吐与 A 轮 ±5% 内为安全，>10% 为过度优化"的判据，
+   却没有任何一轮数据去套用这个判据。
+
+#### 7.17.4 补测命令清单（把缺的这条腿补上）
+
+在 §3 的 A / B 两轮服务**各在跑时**，分别执行以下命令（服务**不要重启**，避免 KV Cache 状态变化），
+即可补齐吞吐 / TPOT / ITL / E2EL 的 A/B 对比。**关键：A/B 用完全相同的 bench 参数**。
+
+```bash
+cd ~/vllm-serving-optimization && source .venv/bin/activate
+
+# ===== A 基线（fcfs）服务在跑时执行 =====
+vllm bench serve \
+    --backend openai --model Qwen/Qwen2.5-1.5B-Instruct \
+    --base-url http://127.0.0.1:8000 --endpoint /v1/completions \
+    --dataset-name random --random-input-len 1024 --random-output-len 128 \
+    --num-prompts 1000 --request-rate 10 --temperature 0 --ignore-eos \
+    --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,95,99 \
+    --save-result --result-dir results/baseline_fcfs/abs_bench/ \
+    --result-filename abs_bench.json --metadata tier=baseline policy=fcfs
+
+# ===== B 优化（priority）服务在跑时执行（相同参数）=====
+vllm bench serve \
+    --backend openai --model Qwen/Qwen2.5-1.5B-Instruct \
+    --base-url http://127.0.0.1:8000 --endpoint /v1/completions \
+    --dataset-name random --random-input-len 1024 --random-output-len 128 \
+    --num-prompts 1000 --request-rate 10 --temperature 0 --ignore-eos \
+    --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,95,99 \
+    --save-result --result-dir results/optimized_qos/abs_bench/ \
+    --result-filename abs_bench.json --metadata tier=optimized policy=priority
+```
+
+> 详细参数说明见 §扩展 0.3；A/B 对比判据（±5% 安全 / >10% 过度优化）见 §扩展 0.5 与 §7.0.2。
+
+补测后，把结果按下表填入，才算完成"绝对性能不退化"的验证：
+
+| 指标 | A 基线 | B 优化 | 差异 | 判定（±5% 安全 / >10% 过度） |
+|------|--------|--------|------|------------------------------|
+| Request throughput (req/s) | 待测 | 待测 | | |
+| Output token throughput (tok/s) | 待测 | 待测 | | |
+| P99 TTFT (ms) | 待测 | 待测 | | |
+| P99 TPOT (ms) | 待测 | 待测 | | |
+| P99 ITL (ms) | 待测 | 待测 | | |
+| Failed requests | 待测 | 待测 | | |
+
+> **注意**：§7 的核心场景是「临界过载（`--bronze-qps-scale 0.2`）」，而上面 `vllm bench serve` 用的是
+> 单一 random 流量的恒定 10 QPS，两者负载模型不同。要严格对齐 §7 结论，还应在**过载负载下**补一组
+> 吞吐对比（例如加跑 `--request-rate inf` 测最大并发吞吐，或扫多档 QPS，见 §扩展 0.6），
+> 用以量化"拒绝换来的公平性"到底牺牲了多少有效吞吐。
 
 ---
 
