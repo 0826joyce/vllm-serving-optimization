@@ -2556,39 +2556,91 @@ silver 用户拿到的不是"更快"，而是"被拒绝"。这需要业务侧决
 
 ---
 
-## 附录 B：进阶优化点测试展望（优化 9 / 10）
+## 附录 B：优化 9 多模型资源池化测试（已实现 · 方案 B 外部编排）
 
 > 对应 [`scheduling-resource-management-optimization.md`](../basic_optimization/scheduling-resource-management-optimization.md)
-> 新增的优化 9（KV 到达事件驱动调度）、优化 10（多模型资源池化）。这两项为方案设计，实现后按下表验证。
+> 的优化 9（多模型资源池化）。**已实现**为「多个独立 vLLM 实例 + 外部编排器」形态
+> （单实例内多模型在 V1 架构不可行，详见优化文档的可行性结论）。本节给出可直接执行的测试命令。
 
-### B.1 优化 9：KV 到达事件驱动调度（PD 分离场景）
+### B.1 实现说明
 
-> 依赖 PD 分离环境，与 [`PD_DISAGGREGATION_BENCHMARK_GUIDE.md`](./PD_DISAGGREGATION_BENCHMARK_GUIDE.md) 联合测试。
+- **编排器**：`benchmarks/e2e_cases/multi_model_arbiter.py`（独立进程，零侵入引擎）——
+  轮询各实例 `/metrics` 负载，空闲超阈值 → `POST /sleep` 释放显存，重新有请求 → `POST /wake_up`，并记录唤醒延迟。
+- **错峰压测**：`benchmarks/e2e_cases/skew_workload.py`——先只打 A、后只打 B，制造「一忙一闲」触发 sleep/wake。
+- **诚实边界**：sleep/wake 是**整实例**粗粒度切换，唤醒有秒级延迟；不涉及底层虚拟显存
+  （xLLM PR #861 的 Global XTensor / CUDA VMM 那类深度改造超出本项目范围）。
 
-| 对照 | 场景 | 验证目标 | 关键指标 |
-|------|------|---------|---------|
-| 轮询式等 KV vs 事件驱动（`WAITING_FOR_REMOTE_KVS`） | PD 分离，Decode 实例等远端 KV | 事件驱动是否降低调度开销、等 KV 请求不干扰正常调度 | 调度循环 CPU 占用、等 KV 请求的排队时间、正常请求 TTFT 是否受干扰 |
-| 无超时回退 vs 有超时回退 | 人为制造 KV 传输失败/延迟 | 超时回退安全网是否避免请求永久卡死 | 卡死请求数、超时回退触发次数、故障下的完成率 |
+### B.2 前置条件（关键，否则测不了）
 
-**核心判据**：① 事件驱动下正常请求的调度不被"等 KV 的请求"干扰（TTFT 无明显抬升）；② KV 传输故障时，请求能通过超时回退降级为本地重算，**不出现永久卡死**（这是工程健壮性的关键验证）。
+每个被编排的实例启动时**必须**满足两点（源码确认）：
 
-### B.2 优化 10：多模型资源池化调度
+- `--enable-sleep-mode`：否则 sleep 的显存池机制不生效；
+- 环境变量 `VLLM_SERVER_DEV_MODE=1`：否则 `/sleep`、`/wake_up`、`/is_sleeping` 路由**不注册**（404）。
 
-> ⚠️ 受单卡限制，本项目只能验证"调度层配额仲裁 + sleep/wake 触发"，
-> **不涉及底层虚拟显存**（Global XTensor 那类需 CUDA VMM 的深度改造，超出本项目范围）。
+### B.3 完整测试步骤（4 个进程，无需 Docker）
 
-| 对照 | 场景 | 验证目标 | 关键指标 |
-|------|------|---------|---------|
-| 单模型独占 vs 多模型共享（配额仲裁） | 单卡部署 2 个小模型，交替负载 | 资源池化是否提升 GPU 利用率 | GPU 利用率、各模型 TTFT/吞吐、显存占用 |
-| 常驻 vs sleep/wake | 一个模型间歇空闲 | 空闲模型 sleep 释放显存后，另一模型是否获得更多资源 | sleep/wake 耗时、唤醒延迟、总吞吐 |
+```bash
+cd ~/vllm-serving-optimization && source .venv/bin/activate
 
-**核心判据**：① 多模型共享单卡时总 GPU 利用率应高于"两模型各占一半但互不相让"；② sleep/wake 的**唤醒延迟**要可接受（这是资源池化的主要代价——用时间换空间）。
+# ---- 进程1：实例 A（占 ~40% 显存）----
+VLLM_SERVER_DEV_MODE=1 python -m vllm.entrypoints.openai.api_server \
+    --model Qwen/Qwen2.5-0.5B-Instruct --enable-sleep-mode \
+    --gpu-memory-utilization 0.4 --port 8001 2>&1 | tee server_A.log &
 
-> **诚实边界**：多模型资源池化的完整价值（如 xLLM PR #861 的虚拟显存 + Global XTensor + Fork/D2D 加速唤醒）
-> 需要底层显存虚拟化支撑，**本项目的调度层实现只能触及"配额仲裁 + 官方 sleep/wake"这一层**，测试结论应据此限定范围。
+# ---- 进程2：实例 B（占 ~40% 显存）----
+VLLM_SERVER_DEV_MODE=1 python -m vllm.entrypoints.openai.api_server \
+    --model Qwen/Qwen2.5-0.5B-Instruct --enable-sleep-mode \
+    --gpu-memory-utilization 0.4 --port 8002 2>&1 | tee server_B.log &
 
-### B.3 共同前提
+# 等两个实例都出现 "Application startup complete"
 
-- 优化 9 需先具备可运行的 PD 分离环境（见 `PD_DISAGGREGATION_BENCHMARK_GUIDE.md` Step 0 的功能确认）。
-- 优化 10 需 vLLM 官方 sleep/wake_up 能力可用。
-- 两项都应复用本文档 Quick Start 搭好的 Prometheus + Grafana 采集服务端指标。
+# ---- 进程3：编排器（空闲 60s 即 sleep，轮询 5s，跑 600s）----
+python benchmarks/e2e_cases/multi_model_arbiter.py \
+    --backend name=modelA,url=http://127.0.0.1:8001 \
+    --backend name=modelB,url=http://127.0.0.1:8002 \
+    --idle-sleep-seconds 60 --poll-interval 5 --duration 600 \
+    --result-file arbiter_result.json &
+
+# ---- 进程4：错峰压测（busy 90s > idle 60s，才能触发 sleep；2 轮）----
+python benchmarks/e2e_cases/skew_workload.py \
+    --backend name=modelA,url=http://127.0.0.1:8001 \
+    --backend name=modelB,url=http://127.0.0.1:8002 \
+    --model Qwen/Qwen2.5-0.5B-Instruct \
+    --busy-seconds 90 --cycles 2 --qps 5 \
+    --result-file skew_result.json
+```
+
+> **先 dry-run 验证判定逻辑**（不实际 sleep/wake，只看负载曲线）：给编排器加 `--dry-run` 跑一遍，
+> 确认「A 忙时 B 判为空闲、到点该 sleep」的逻辑无误后，再去掉 `--dry-run` 实测。
+
+**一键方式**（把上述 4 个进程串起来，跑完自动收尾）：
+
+```bash
+bash benchmarks/e2e_cases/run_multimodel_pool.sh
+# 可用环境变量覆盖参数：
+MODEL=Qwen/Qwen2.5-0.5B-Instruct IDLE=60 BUSY=90 CYCLES=2 QPS=5 \
+    bash benchmarks/e2e_cases/run_multimodel_pool.sh
+```
+脚本自动：起实例 A/B（带 `--enable-sleep-mode` + `VLLM_SERVER_DEV_MODE=1`）→ 等 `/health` 就绪 →
+起编排器 → 跑错峰压测 → 结束后关闭所有进程；日志与结果 JSON 输出到 `pool_test_logs/`。
+
+### B.4 观测与判据
+
+| 对照 | 场景 | 验证目标 | 关键指标 / 数据来源 |
+|------|------|---------|--------------------|
+| 常驻 vs 编排（sleep/wake） | A/B 错峰忙闲 | 空闲实例 sleep 是否真释放显存 | `nvidia-smi`（sleep 前后显存占用）、`arbiter_result.json` 的 `total_sleep_seconds` |
+| 无编排 vs 有编排 | 同上 | 池化是否提升整卡有效利用率 | 整卡 GPU 利用率（`nvidia-smi`/Grafana）、两模型总吞吐 |
+| —— | 空闲实例被唤醒 | 唤醒代价是否可接受 | `arbiter_result.json` 的 `avg_wake_latency_s` / `max_wake_latency_s` |
+| —— | 唤醒窗口的请求 | 唤醒延迟对首请求的影响 | `skew_result.json` 里被唤醒实例的 `max_latency_s`（含唤醒时间） |
+
+**核心判据**：
+1. **sleep 真释放显存**：`nvidia-smi` 在某实例 sleep 后显存明显下降（Level 1 释放权重占用）；
+2. **唤醒延迟可接受**：编排器记录的 `wake_latencies` 在秒级可接受范围——这是「用时间换空间」的代价；
+3. **池化有正收益**：错峰场景下，有编排（闲的睡、让出显存）相比两实例都常驻，整卡利用率/总吞吐应更优。
+
+### B.5 诚实边界
+
+- 受**单卡显存**限制，只能起小模型（0.5B）验证机制正确性；完整错峰收益（大模型、多卡）需更大资源。
+- 唤醒延迟受官方**粗粒度 offload** 限制，无法达到 xLLM 虚拟显存方案（Pinned DRAM + D2D）的唤醒速度；
+  本测试结论应限定在「调度/编排层 sleep/wake 机制」范围内解读。
+- 应复用本文档 Quick Start 搭好的 Prometheus + Grafana 采集服务端指标（利用率、吞吐曲线）。

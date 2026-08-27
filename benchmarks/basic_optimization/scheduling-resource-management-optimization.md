@@ -316,104 +316,126 @@ prefill 的 chunk 之间插队。
 
 ---
 
-### 优化 9：KV 到达事件驱动调度（PD 分离场景） `[P2]` `[方案设计]`
+### 优化 9：多模型实例的资源池化调度 `[P3]` `[已实现 ✅（方案 B：外部编排）]`
 
-> 对应能力迁移：**事件驱动 I/O（epoll/事件循环）→ KV 就绪事件触发调度**
-> 呼应 [`pd-disaggregation-optimization.md`](./pd-disaggregation-optimization.md) 的 PD 分离场景。
-
-#### 问题分析
-
-当调度器与 PD 分离结合时，Decode 实例的请求需要**等待 Prefill 实例把 KV cache 传过来**才能开始 decode。当前调度是"轮询式"——每步都去检查 KV 到了没，浪费调度开销；且请求在等 KV 时若仍留在 waiting 参与排序，会干扰正常调度。
-
-#### 设计方案
-
-引入一个**等待远端 KV 的独立状态**（`WAITING_FOR_REMOTE_KVS`），配合 KV 到达事件驱动：
-
-```python
-class KVReceiveMonitor:
-    """监控 PD 分离下 KV cache 的到达，事件驱动地唤醒等待的请求。"""
-
-    def __init__(self, timeout_s: float = 30.0):
-        self._waiting_for_kv: dict[str, float] = {}   # req_id → 开始等待的时间
-
-    def on_request_waiting_kv(self, request):
-        """请求进入"等待远端 KV"状态，暂时移出正常调度队列。"""
-        request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
-        self._waiting_for_kv[request.request_id] = time.monotonic()
-
-    def poll_ready(self, connector) -> list[str]:
-        """事件驱动：返回 KV 已到达、可以恢复调度的请求。"""
-        ready = []
-        for req_id, start in list(self._waiting_for_kv.items()):
-            if connector.is_kv_ready(req_id):        # KV 到达事件
-                ready.append(req_id)
-                del self._waiting_for_kv[req_id]
-            elif time.monotonic() - start > self.timeout_s:
-                # 超时回退：KV 迟迟不到 → 降级为本地重算（安全网）
-                ready.append(req_id)                  # 唤醒但标记为需本地 recompute
-                del self._waiting_for_kv[req_id]
-        return ready
-```
-
-**关键设计**：
-1. **独立状态隔离**：等 KV 的请求移出正常 waiting 队列，不干扰 QoS/MLFQ 排序。
-2. **事件驱动而非轮询**：KV 到达才唤醒，减少无效调度检查。
-3. **超时回退安全网**：KV 传输失败/超时 → 降级为本地重算，保证请求不会永久卡死（这是工程健壮性关键）。
-
-#### 修改文件
-- `vllm/v1/core/sched/scheduler.py` — 集成 `WAITING_FOR_REMOTE_KVS` 状态处理
-- 新增 `vllm/v1/core/sched/kv_receive_monitor.py`
-
-#### 预期效果
-- PD 分离下调度开销降低（不再轮询等 KV）
-- 等 KV 的请求不占算力、不干扰正常调度
-- KV 传输故障时有降级路径，不会卡死请求
-
----
-
-### 优化 10：多模型实例的资源池化调度 `[P3]` `[方案设计]`
-
-> 对应能力迁移：**云资源池化 / 容器编排（K8s bin-packing）→ 单实例多模型的 GPU 资源复用**
+> 对应能力迁移：**云资源池化 / 容器编排（K8s bin-packing / scale-to-zero）→ 多个 vLLM 实例的 GPU 资源复用**
 
 #### 问题分析
 
-单实例单模型时，若该模型负载低，GPU 算力和显存大量闲置。若能在一个实例里**按需调度多个模型**、空闲模型让出资源，可大幅提升利用率、降低成本。
+单实例单模型时，若该模型负载低，GPU 算力和显存大量闲置。若能让多个模型**按需共享 GPU**、
+空闲模型让出显存，可大幅提升利用率、降低成本。
 
-#### 设计方案
+#### 可行性结论（实现前的架构评估，重要）
 
-在调度器之上加一层**模型级资源仲裁**：
+最初设想是「在**一个引擎实例内**挂多个模型、由调度器做模型级仲裁」。核对 vLLM V1 源码后确认
+**该前提不成立**，据实修正如下：
 
-```python
-class MultiModelResourceArbiter:
-    """多模型资源仲裁：在模型间分配 GPU 显存/算力配额。"""
+| 事实（源码依据） | 结论 |
+|-----------------|------|
+| `EngineCore.__init__` 里 `self.model_executor = executor_class(vllm_config)`，**一个实例只绑定一个模型** | 「单实例内多模型」在 V1 **不存在对应结构** |
+| `sleep/wake_up`（`engine/core.py`）是对**整个实例**操作，Level 1 offload 全部权重、丢弃 KV | 无法「让实例内某个模型睡、另一个醒」 |
+| KV Cache 显存池在启动 profiling 时一次性定死（`num_gpu_blocks`） | 运行时**无法动态改单实例的显存配额** |
 
-    def __init__(self, models: dict, total_memory: int):
-        self.models = models                      # model_id → 模型实例
-        self.memory_quota: dict[str, int] = {}    # 每个模型的显存配额
+因此把优化 9 重新定位为业界真正可落地的形态——**多个独立 vLLM 实例 + 外部编排器**
+（这也是 vLLM 官方 sleep/wake + Router 的标准用法）：
 
-    def rebalance(self, load_stats: dict[str, float]):
-        """按各模型近期负载动态调整显存配额（用得多的多分）。"""
-        total_load = sum(load_stats.values()) or 1.0
-        for model_id, load in load_stats.items():
-            self.memory_quota[model_id] = int(self.total_memory * load / total_load)
-
-    def should_sleep(self, model_id: str) -> bool:
-        """长时间无请求的模型 → sleep 释放显存（对应 vLLM sleep/wake_up）。"""
-        return self._idle_time(model_id) > self.sleep_threshold_s
+```
+┌─ vLLM 实例 A（模型 A，独立进程，独立端口）
+├─ vLLM 实例 B（模型 B，独立进程，独立端口）
+└─ 外部编排器 multi_model_arbiter.py（本优化实现）
+     ├─ 轮询各实例 /metrics 的 running/waiting 负载
+     ├─ 持续空闲超阈值 → POST /sleep 释放显存（scale-to-zero）
+     └─ 重新有请求 → POST /wake_up 唤醒
 ```
 
-> **据实说明**：这一项在 vLLM 里对应官方的 **sleep/wake_up API** + 显存 offload 机制。真正的
-> "虚拟显存 + 多模型统一接管"（如 xLLM PR #861 的 Global XTensor）需要底层显存虚拟化（CUDA VMM），
-> **属于比本项目调度层更深的基础设施改造**，本优化仅在调度层做"配额仲裁 + sleep/wake 触发"，
-> 不涉及底层显存虚拟化。
+#### 实现（核心逻辑）
 
-#### 修改文件
-- 新增 `vllm/v1/core/sched/multi_model_arbiter.py`
-- 依赖 vLLM 官方 sleep/wake_up 能力
+编排器是**独立进程**（`benchmarks/e2e_cases/multi_model_arbiter.py`），用 vLLM 现成的
+HTTP `/sleep`、`/wake_up`、`/is_sleeping`、`/metrics` 接口编排多个实例，零侵入引擎代码：
+
+```python
+def arbitrate_once(backends, idle_sleep_seconds, sleep_level, dry_run):
+    now = time.monotonic()
+    for b in backends:
+        load = probe_load(b)                       # GET /metrics 解析 running/waiting
+        has_work = load["running"] > 0 or load["waiting"] > 0
+        if has_work:
+            b.last_active_ts = now
+            if b.sleeping:
+                do_wake(b, dry_run)                # 有新请求 → POST /wake_up（记唤醒延迟）
+        else:
+            idle_for = now - b.last_active_ts
+            if not b.sleeping and idle_for >= idle_sleep_seconds:
+                do_sleep(b, sleep_level, dry_run)  # 持续空闲 → POST /sleep 释放显存
+```
+
+> **据实说明（诚实边界）**：这是**调度/编排层**的粗粒度实现——sleep/wake 是**整实例**切换，
+> 唤醒有秒级延迟（用时间换空间）。真正的「虚拟显存 + 多模型统一接管」（如 xLLM PR #861 的
+> Global XTensor + CUDA VMM + Pinned DRAM/D2D 加速唤醒）需要**底层显存虚拟化改造**，
+> 难度与收益都高一个量级，**不在本项目范围**。本优化不改引擎、不做显存虚拟化，
+> 仅用官方 API 做「负载感知的 sleep/wake 编排」。
+
+#### 启动前提（每个被编排实例都要满足）
+
+```bash
+VLLM_SERVER_DEV_MODE=1 python -m vllm.entrypoints.openai.api_server \
+    --model <model> --enable-sleep-mode \
+    --gpu-memory-utilization <单卡多实例按比例分> --port <port>
+```
+- `--enable-sleep-mode`：否则 sleep 的显存池机制不生效；
+- `VLLM_SERVER_DEV_MODE=1`：否则 `/sleep`、`/wake_up`、`/is_sleeping` 路由**不注册**（404）。
+
+#### 涉及文件
+- 新增 `benchmarks/e2e_cases/multi_model_arbiter.py`（独立编排器，不改引擎）
+- 复用 vLLM 官方 `sleep`/`wake_up`/`is_sleeping` HTTP API（`entrypoints/serve/sleep/api_router.py`）
+
+#### 测试方案（方案 B：多实例池化）
+
+> 目标：验证「空闲实例 sleep 释放显存 → 让出的显存被其他实例/唤醒使用」的资源池化收益，
+> 并量化 sleep/wake 的核心代价——**唤醒延迟**。
+
+**测试拓扑**（单卡起 2 个小模型 + 编排器 + 压测，共约 4 个进程，无需 Docker）：
+
+```bash
+# 进程1：实例 A（占 ~40% 显存）
+VLLM_SERVER_DEV_MODE=1 python -m vllm.entrypoints.openai.api_server \
+    --model Qwen/Qwen2.5-0.5B-Instruct --enable-sleep-mode \
+    --gpu-memory-utilization 0.4 --port 8001 &
+
+# 进程2：实例 B（占 ~40% 显存）
+VLLM_SERVER_DEV_MODE=1 python -m vllm.entrypoints.openai.api_server \
+    --model Qwen/Qwen2.5-0.5B-Instruct --enable-sleep-mode \
+    --gpu-memory-utilization 0.4 --port 8002 &
+
+# 进程3：编排器（空闲 60s 即 sleep，轮询 5s，跑 600s）
+python benchmarks/e2e_cases/multi_model_arbiter.py \
+    --backend name=modelA,url=http://127.0.0.1:8001 \
+    --backend name=modelB,url=http://127.0.0.1:8002 \
+    --idle-sleep-seconds 60 --poll-interval 5 --duration 600 \
+    --result-file arbiter_result.json
+
+# 进程4：错峰压测——先只打 A、后只打 B，制造「一个忙一个闲」
+```
+
+**对照与判据**：
+
+| 对照 | 场景 | 验证目标 | 关键指标 |
+|------|------|---------|---------|
+| 常驻 vs 编排（sleep/wake） | A/B 交替忙闲（错峰负载） | 空闲实例 sleep 是否真释放显存 | `nvidia-smi` 显存占用（睡前/睡后）、`arbiter_result.json` 的 `total_sleep_seconds` |
+| 无编排 vs 有编排 | 同上 | 池化是否提升整卡有效利用率 | 整卡 GPU 利用率、两模型总吞吐 |
+| —— | 空闲实例被唤醒 | 唤醒代价是否可接受 | `avg_wake_latency_s` / `max_wake_latency_s`（编排器自动记录） |
+
+**核心判据**：① sleep 后 `nvidia-smi` 显存明显下降（Level 1 应释放权重占用）；
+② 唤醒延迟在可接受范围（编排器输出的 `wake_latencies`）——这是资源池化「用时间换空间」的代价；
+③ 先用 `--dry-run` 只观测负载曲线、确认判定逻辑无误，再实测 sleep/wake。
+
+> **诚实边界（测试同样适用）**：受单卡显存限制，只能起小模型验证机制正确性；
+> 完整的错峰收益（多大模型、多卡）需更大资源。且唤醒延迟受官方粗粒度 offload 限制，
+> 无法达到 xLLM 虚拟显存方案的唤醒速度。
 
 #### 预期效果
-- 多模型共享单卡，闲时让出资源，提升 GPU 利用率、降成本
-- ⚠️ 局限：受限于单卡显存与官方 offload 能力，深度虚拟显存需底层改造
+- 多实例共享单卡，闲时 sleep 让出显存，提升整卡利用率、降成本（错峰场景收益最明显）
+- ⚠️ 局限：受限于单卡显存与官方粗粒度 offload 能力；深度虚拟显存（快速唤醒）需底层改造
 
 ---
 
