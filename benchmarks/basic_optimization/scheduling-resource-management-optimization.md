@@ -316,31 +316,156 @@ prefill 的 chunk 之间插队。
 
 ---
 
+### 优化 9：KV 到达事件驱动调度（PD 分离场景） `[P2]` `[方案设计]`
+
+> 对应能力迁移：**事件驱动 I/O（epoll/事件循环）→ KV 就绪事件触发调度**
+> 呼应 [`pd-disaggregation-optimization.md`](./pd-disaggregation-optimization.md) 的 PD 分离场景。
+
+#### 问题分析
+
+当调度器与 PD 分离结合时，Decode 实例的请求需要**等待 Prefill 实例把 KV cache 传过来**才能开始 decode。当前调度是"轮询式"——每步都去检查 KV 到了没，浪费调度开销；且请求在等 KV 时若仍留在 waiting 参与排序，会干扰正常调度。
+
+#### 设计方案
+
+引入一个**等待远端 KV 的独立状态**（`WAITING_FOR_REMOTE_KVS`），配合 KV 到达事件驱动：
+
+```python
+class KVReceiveMonitor:
+    """监控 PD 分离下 KV cache 的到达，事件驱动地唤醒等待的请求。"""
+
+    def __init__(self, timeout_s: float = 30.0):
+        self._waiting_for_kv: dict[str, float] = {}   # req_id → 开始等待的时间
+
+    def on_request_waiting_kv(self, request):
+        """请求进入"等待远端 KV"状态，暂时移出正常调度队列。"""
+        request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+        self._waiting_for_kv[request.request_id] = time.monotonic()
+
+    def poll_ready(self, connector) -> list[str]:
+        """事件驱动：返回 KV 已到达、可以恢复调度的请求。"""
+        ready = []
+        for req_id, start in list(self._waiting_for_kv.items()):
+            if connector.is_kv_ready(req_id):        # KV 到达事件
+                ready.append(req_id)
+                del self._waiting_for_kv[req_id]
+            elif time.monotonic() - start > self.timeout_s:
+                # 超时回退：KV 迟迟不到 → 降级为本地重算（安全网）
+                ready.append(req_id)                  # 唤醒但标记为需本地 recompute
+                del self._waiting_for_kv[req_id]
+        return ready
+```
+
+**关键设计**：
+1. **独立状态隔离**：等 KV 的请求移出正常 waiting 队列，不干扰 QoS/MLFQ 排序。
+2. **事件驱动而非轮询**：KV 到达才唤醒，减少无效调度检查。
+3. **超时回退安全网**：KV 传输失败/超时 → 降级为本地重算，保证请求不会永久卡死（这是工程健壮性关键）。
+
+#### 修改文件
+- `vllm/v1/core/sched/scheduler.py` — 集成 `WAITING_FOR_REMOTE_KVS` 状态处理
+- 新增 `vllm/v1/core/sched/kv_receive_monitor.py`
+
+#### 预期效果
+- PD 分离下调度开销降低（不再轮询等 KV）
+- 等 KV 的请求不占算力、不干扰正常调度
+- KV 传输故障时有降级路径，不会卡死请求
+
+---
+
+### 优化 10：多模型实例的资源池化调度 `[P3]` `[方案设计]`
+
+> 对应能力迁移：**云资源池化 / 容器编排（K8s bin-packing）→ 单实例多模型的 GPU 资源复用**
+
+#### 问题分析
+
+单实例单模型时，若该模型负载低，GPU 算力和显存大量闲置。若能在一个实例里**按需调度多个模型**、空闲模型让出资源，可大幅提升利用率、降低成本。
+
+#### 设计方案
+
+在调度器之上加一层**模型级资源仲裁**：
+
+```python
+class MultiModelResourceArbiter:
+    """多模型资源仲裁：在模型间分配 GPU 显存/算力配额。"""
+
+    def __init__(self, models: dict, total_memory: int):
+        self.models = models                      # model_id → 模型实例
+        self.memory_quota: dict[str, int] = {}    # 每个模型的显存配额
+
+    def rebalance(self, load_stats: dict[str, float]):
+        """按各模型近期负载动态调整显存配额（用得多的多分）。"""
+        total_load = sum(load_stats.values()) or 1.0
+        for model_id, load in load_stats.items():
+            self.memory_quota[model_id] = int(self.total_memory * load / total_load)
+
+    def should_sleep(self, model_id: str) -> bool:
+        """长时间无请求的模型 → sleep 释放显存（对应 vLLM sleep/wake_up）。"""
+        return self._idle_time(model_id) > self.sleep_threshold_s
+```
+
+> **据实说明**：这一项在 vLLM 里对应官方的 **sleep/wake_up API** + 显存 offload 机制。真正的
+> "虚拟显存 + 多模型统一接管"（如 xLLM PR #861 的 Global XTensor）需要底层显存虚拟化（CUDA VMM），
+> **属于比本项目调度层更深的基础设施改造**，本优化仅在调度层做"配额仲裁 + sleep/wake 触发"，
+> 不涉及底层显存虚拟化。
+
+#### 修改文件
+- 新增 `vllm/v1/core/sched/multi_model_arbiter.py`
+- 依赖 vLLM 官方 sleep/wake_up 能力
+
+#### 预期效果
+- 多模型共享单卡，闲时让出资源，提升 GPU 利用率、降成本
+- ⚠️ 局限：受限于单卡显存与官方 offload 能力，深度虚拟显存需底层改造
+
+---
+
 ## 五、调度四层架构
 
-8 个优化点共同构成一个完整的调度流水线，每个优化负责一个决策环节：
+6 个已实现优化点共同构成一个完整的调度流水线，每个优化负责一个决策环节：
 
 ```
 请求到达
-    │
-    ▼
-优化 6（WFQ）：按 tenant_id 分流 → 保证租户间公平
-    │
-    ▼
-优化 1（QoS）：同一租户内按 effective_priority 排序
-    │
-    ▼
-优化 7（MLFQ）：同优先级内自适应排序（短请求自动优先）
-    │
-    ▼
-请求被选中，进入 running 状态
-    │
-    ▼
-优化 4（Token 限速）：低优请求限速，为高优让出 token_budget
-    │
-    ▼
-输出 tokens
+   │
+   ▼  优化6 WFQ ── 按 tenant_id 分流，检查租户并发上限（保证租户间公平）
+   │
+   ▼  优化3 准入控制 ── 过载时？队列满(40)/违约率高(0.25)→ 拒绝低优（gold 放行）
+   │
+   ▼  优化1 QoS ── 算 effective_priority，waiting 队列按优先级排序
+   │
+   ▼  优化7 MLFQ ── 同优先级内按 token 消耗自动分级（短请求优先）
+   │
+   ▼  优化5 Deadline ── 紧急请求（快到期）再插队；抢占时先抢已违约的
+   │
+   ▼  请求被选中，进入 running
+   │
+   ▼  优化4 Token 限速 ── 低优请求限速(8~64 tok/step)，把预算让给高优
+   │  （配套：长文档 prefill 让位，每步最多 1 个长 continuation）
+   │
+   ▼  输出 tokens
 ```
+
+> **分层理解**：
+> - **入口关卡**（决定"能不能进/进哪"）：优化 6 租户分流 → 优化 3 过载准入。
+> - **waiting 排序**（决定"谁先进 running"）：优化 1 QoS（主键）→ 优化 7 MLFQ（次键）→ 优化 5 Deadline（紧急插队）。
+> - **running 运行时**（已在 GPU 上跑）：优化 4 Token 限速（控速）+ 抢占（缺资源时先踢已违约/最低优的）+ 长文档 prefill 让位。
+
+### 各优化作用的队列/阶段（重要）
+
+vLLM 调度有两个核心队列：**waiting**（等待被调度的请求）和 **running**（已在 GPU 上并行生成 token 的请求）。每个优化明确作用在哪个阶段：
+
+| 优化 | 作用队列/阶段 | 具体做什么 | 备注 |
+|------|-------------|-----------|------|
+| **优化 6 WFQ/租户隔离** | **入口：waiting → running 准入** | 检查该租户在 running 的并发数是否达上限（默认 64），达到则该请求这步不进 running（留 waiting） | 控制"每个租户能有多少请求同时在 running" |
+| **优化 3 准入控制** | **入口：进 waiting 之前** | 过载时（队列深度≥40 或违约率>0.25）直接拒绝低优新请求（503），gold 放行 | 请求根本进不了系统，不占队列 |
+| **优化 1 QoS** | **waiting 排序**（+ running 抢占） | 算 `effective_priority`，作为 waiting 出队的**第一排序键**；running 里作为抢占选择依据 | waiting 主键；running 里不排序、只定"抢占谁" |
+| **优化 7 MLFQ** | **waiting 排序** | 按累计 token 消耗自动降级，作为 waiting 出队的**第二排序键**（QoS 相等时比 level） | 计数记在请求对象上，跨 waiting/running 往返不丢失 |
+| **优化 5 Deadline** | **waiting 排序**（+ running 抢占） | 紧急（快到期）请求在 waiting 里插队；抢占时先踢 running 里已违约的 | waiting 排序 + running 抢占对象选择 |
+| **优化 4 Token 限速** | **running 运行时** | 对 running 里每个请求，按档位+负载限制它每步能生成的 token 数 | 唯一真正作用在 running 内部的"控速"机制 |
+| **配套 长文档 prefill 让位** | **running 运行时** | 限制 running 里长文档 continuation prefill 每步最多 1 个，让 budget 给 waiting 的短请求插队 | 作用在 running 的调度分配 |
+
+> **一句话记忆**：
+> - **"排队顺序"类**（QoS / MLFQ / Deadline 的排序部分）→ 全作用在 **waiting**，决定"谁先进 running"。
+> - **"准入名额"类**（WFQ 租户隔离 / 准入控制）→ 作用在 **入口**，决定"能不能进、进不进得来"。
+> - **"运行时控速"类**（Token 限速 / 长文档让位 / 抢占）→ 作用在 **running**，决定"已在跑的请求各跑多快、缺资源时踢谁"。
+> - **running 内部不做"重新排队"**——里面的请求是并行 forward 的，没有先后顺序，只有"限速"和"抢占淘汰"。
 
 ---
 
@@ -407,3 +532,81 @@ prefill 的 chunk 之间插队。
 > `benchmarks/e2e_cases/SCHEDULING_BENCHMARK_GUIDE.md` §7）。核心结论：优先级调度 +
 > 准入控制能有效保护 silver/bronze 租户（违约率 -53~-56pp），但无法保护 gold
 > （最高优先级自身过载，物理无解）。
+
+---
+
+## 十一、优化点详解速查（含真实参数与代码落点）
+
+> 本节把 6 个已实现优化点逐个讲清「原理 → 解决什么 → 真实参数 → 代码落点」，
+> 参数值均来自源码（`vllm/v1/request.py`、`vllm/v1/core/sched/scheduler.py`、
+> `vllm/v1/core/sched/tenant_manager.py`），可直接对照。
+
+### 11.1 参数总表
+
+| 优化 | 开关 | 核心参数（真实值） | 是否在 §7 调过 |
+|------|------|-------------------|--------------|
+| 1 QoS 分级 | `--scheduling-policy priority`（`fcfs` 关） | 短 prompt 线 `SHORT_PROMPT_THRESHOLD=512`、中 `2048`；boost 短 `-2`/中 `-1`/长 `+1`；防饿死 `STARVATION_DECAY_INTERVAL=5s` | ❌ 固定 |
+| 3 准入控制 | `VLLM_DISABLE_OVERLOAD_MGMT=1` 关 | **`max_queue_depth=40`、`overload_violation_threshold=0.25`、`_sla_violation_window` maxlen`=25`**；高优判定 `priority < 0` | ✅ **反复调**（§7.4/§7.6） |
+| 4 Token 限速 | `VLLM_DISABLE_RATE_LIMIT=1` 关 | 低优 rate 动态 `8~64 tokens/step`；per-request 令牌桶 `TokenRateLimiter` | ❌ 固定 |
+| 5 Deadline | `VLLM_DISABLE_DEADLINE_AWARE=1` 关（依附过载管理） | `deadline = arrival_time + sla_ttft_ms`；`slack_time`/`sla_urgency` | ❌ 固定 |
+| 6 WFQ/租户隔离 | `VLLM_DISABLE_TENANT_ISO=1` 关 | **租户并发上限 `default_max_running=64`**、`default_weight=1.0`；`effective_weight = weight / max(1, running)` | ❌ 固定 |
+| 7 MLFQ | `VLLM_DISABLE_MLFQ=1` 关 | 4 级配额 L0`=128` / L1`=512` / L2`=2048` / L3`=∞` | ❌ 固定 |
+| 配套 长文档让位 | `VLLM_DISABLE_LONG_PREFILL_YIELD=1` 关 | 长文档线 `>1024 token`、每步 `max_long_continuation_per_step=1` | ❌ 固定（改的是测试数据） |
+
+### 11.2 WFQ / 租户隔离怎么保证公平（优化 6）
+
+**代码**：`tenant_manager.py` 的 `TenantManager`
+
+公平靠**两个机制**，不是靠"平均分配请求数"：
+
+**机制 1：租户并发上限（硬隔离）**
+
+```python
+default_max_running: int = 64   # 每个租户默认最多 64 个请求同时在 running
+def can_schedule(self, tenant_id):
+    return self.tenant_running.get(tenant_id, 0) < max_allowed
+```
+
+- 每个租户在 `running` 里的请求数有上限（默认 **64**，可 per-tenant 通过 `register_tenant` 覆盖）。
+- 达到上限后，该租户的新请求这一步**被跳过**（留在 waiting 等下一步），**不会被拒绝**。
+- 作用：防止单个租户占满全部 running 槽位，饿死其他租户。
+
+**机制 2：WFQ 动态权重（软公平）**
+
+```python
+def get_scheduling_weight(self, tenant_id):
+    return weight / max(1, running_count)   # 用得越多，权重越低
+```
+
+- 一个租户当前占用的 running 槽越多，它的**有效调度权重越低**，让"用得少"的租户获得优先。
+- 这是"加权公平"——不是绝对平均，而是**动态倾斜给欠服务的租户**。
+
+> **回答你的疑问：每个用户允许的请求数是多少？是固定的吗？**
+> - **默认是固定的 `max_running=64`**（`default_max_running`）——这是每个租户在 running 里的**并发上限**（不是"总共能发多少请求"，是"同时在跑几个"）。
+> - 但它**可 per-tenant 配置**：`register_tenant(tenant_id, max_running=X, weight=Y)` 能给不同租户设不同上限和权重（比如 gold 租户给 128、bronze 给 16）。不配置就用默认 64。
+> - 注意这个"64"和准入控制的 `max_queue_depth=40` **无关**：前者管"每个租户在 running 的并发数"，后者管"整个 waiting 队列的总深度"。
+
+### 11.3 QoS 与 MLFQ 的关系（优化 1 vs 优化 7）—— 排序键的主次
+
+这是最容易混淆的点。**关键事实：在 `priority` 策略下，`waiting` 是一个统一的优先级堆（`PriorityRequestQueue`），出队顺序由 `Request.__lt__` 决定，而 `__lt__` 里 QoS 和 MLFQ 是「主键 + 次键」的关系**：
+
+```python
+# vllm/v1/request.py 的 Request.__lt__（决定谁排队首）
+def __lt__(self, other):
+    # ① 第一关键字：QoS 的 effective_priority（值小 = 优先）
+    if self.effective_priority != other.effective_priority:
+        return self.effective_priority < other.effective_priority
+    # ② 第二关键字：MLFQ level（同优先级时，level 小 = 优先）
+    if self.mlfq_level != other.mlfq_level:
+        return self.mlfq_level < other.mlfq_level
+    # ③ 第三关键字：到达时间（同 level 时 FCFS）
+    if self.arrival_time != other.arrival_time:
+        return self.arrival_time < other.arrival_time
+    return self.request_id < other.request_id
+```
+
+**所以关系是：QoS 定「大组」，MLFQ 在「大组内」再排序，同组同级才看到达时间。**
+
+- **QoS（`effective_priority`）是第一决定因素**：先按它分大档。
+- **MLFQ（`mlfq_level`）是第二决定因素**：只有当两个请求 `effective_priority` **相等**时，才比 MLFQ level（level 小的优先）。
+- **到达时间是第三兜底**：QoS 和 MLFQ 都相等时，才 FCFS。

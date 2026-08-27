@@ -334,8 +334,12 @@ class Scheduler(SchedulerInterface):
         # within the same MLFQ level and re-order by actual prefill tokens
         # (ascending), so requests with higher cache hit rates are scheduled
         # first.
+        # Follows prefix caching by default; can be force-disabled via
+        # VLLM_DISABLE_CACHE_AWARE=1 for A/B benchmarking (see
+        # benchmarks/e2e_cases/PREFIX_CACHE_BENCHMARK_GUIDE.md).
         self.enable_cache_aware_scheduling: bool = (
-            self.cache_config.enable_prefix_caching)
+            self.cache_config.enable_prefix_caching
+            and os.environ.get("VLLM_DISABLE_CACHE_AWARE") != "1")
         self.cache_aware_scan_window: int = 8
 
         # ---- Token Rate Limiting (Token Bucket) ----
