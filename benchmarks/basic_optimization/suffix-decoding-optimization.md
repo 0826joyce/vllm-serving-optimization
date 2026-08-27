@@ -719,26 +719,20 @@ class SuffixTreeProposer:
 
 #### 实际实现
 
-已实现文件：`vllm/v1/spec_decode/suffix_proposer.py`（309 行）
-测试文件：`tests/v1/spec_decode/test_suffix_proposer.py`（224 行）
+> **实现说明（据实修正）**：基础后缀匹配能力最终**并入了优化点 2 的增量后缀自动机（SAM）实现**
+> —— 即 `vllm/v1/spec_decode/suffix_automaton_proposer.py`。设计稿里单独的
+> `suffix_proposer.py`（纯后缀数组版本）**未作为独立文件保留**，因为 SAM 在提供相同"最长后缀匹配 +
+> 自适应回退"能力的同时，还支持 O(1) 增量更新（见优化点 2），功能上完全覆盖了后缀数组版本。
 
-实现要点：
-- 使用 **Numba JIT 编译** 的后缀数组 + 二分搜索，替代设计方案中的纯 Python 后缀数组
-- 后缀数组构建采用 **迭代倍增 + Shell 排序**（O(n·log²n)），JIT 兼容
-- 二分搜索实现 `_sa_lower_bound` / `_sa_upper_bound`，精确定位所有匹配位置
-- 自适应回退：从 n 到 max(2, n//2) 逐步缩短匹配长度
-- 最优匹配选择：遍历所有匹配位置，选择续接最长的（跳过自匹配）
-- 保持与 `NgramProposer` 完全相同的外部接口 `propose(context, n, k)`，可直接替换
-
-测试覆盖：
-- 基础匹配、无匹配、短上下文、重复模式等功能测试
-- 自适应回退行为验证
-- 与 NgramProposer 的对比测试（30 轮随机数据，确保不遗漏匹配）
-- 边界情况：全相同 token、大上下文（2000 tokens）、n=1、dtype 验证
+实现要点（体现在 `suffix_automaton_proposer.py` 的 `SuffixAutomatonProposer`）：
+- **最长后缀匹配**：沿 SAM 转移边走到走不动，即最长匹配（O(pattern_len) 查询）
+- **自适应回退**：从 n 到 max(2, n//2) 逐步缩短匹配长度
+- **续接提取**：用匹配状态的 `first_end_pos` 定位续接起点，返回后续最多 k 个 token
+- 保持与 `NgramProposer` 相同的对外语义 `propose(context, n, k)`，可直接替换
 
 #### 修改文件
-- 新增 `vllm/v1/spec_decode/suffix_proposer.py` — 后缀数组 Proposer（Numba JIT）
-- 新增 `tests/v1/spec_decode/test_suffix_proposer.py` — 完整测试套件
+- 新增 `vllm/v1/spec_decode/suffix_automaton_proposer.py` — 后缀匹配能力最终落在 SAM 实现里
+  （基础后缀数组版本未单独保留，能力并入 SAM）
 
 #### 预期效果
 - 查询时间从 O(context_len) 降到 O(pattern_len * log(context_len))
@@ -936,8 +930,7 @@ class StatefulSuffixProposer:
 
 #### 实际实现
 
-已实现文件：`vllm/v1/spec_decode/suffix_automaton_proposer.py`（359 行）
-测试文件：`tests/v1/spec_decode/test_suffix_automaton_proposer.py`（581 行）
+已实现文件：`vllm/v1/spec_decode/suffix_automaton_proposer.py`
 
 实现要点：
 - 完整实现 **在线后缀自动机（SAM）**：`_SAMNode` + `IncrementalSuffixAutomaton`
@@ -949,18 +942,12 @@ class StatefulSuffixProposer:
 - 上下文收缩检测：如果 context 变短（如抢占后恢复），自动重建 SAM
 - `remove_request()` 清理已完成请求的 SAM 状态，防止内存泄漏
 
-测试覆盖（581 行，7 个测试类）：
-- `TestIncrementalSuffixAutomaton`：SAM 核心数据结构单元测试（9 个用例）
-- `TestSuffixAutomatonProposerBasic`：基础功能测试（7 个用例）
-- `TestSuffixAutomatonProposerIncremental`：增量更新正确性（5 个用例，含压力测试）
-- `TestSuffixAutomatonProposerLifecycle`：请求生命周期管理（4 个用例，含 50 请求批量测试）
-- `TestSuffixAutomatonProposerAdaptive`：自适应回退（2 个用例）
-- `TestSuffixAutomatonVsOthers`：与 NgramProposer/SuffixTreeProposer 对比（3 个用例，200 轮随机数据）
-- `TestSuffixAutomatonProposerPerformance`：大上下文（4000 tokens）、增量更新性能、100 并发请求
+> **测试说明（据实修正）**：`tests/v1/spec_decode/` 下暂**未包含**针对该 proposer 的独立测试文件；
+> 功能正确性目前通过 A/B 压测（见 `benchmarks/e2e_cases/SUFFIX_DECODING_BENCHMARK_GUIDE.md`）
+> 与开发期的手工冒烟验证保障。补充单元测试列在待办中。
 
 #### 修改文件
 - 新增 `vllm/v1/spec_decode/suffix_automaton_proposer.py` — 增量 SAM + `SuffixAutomatonProposer`
-- 新增 `tests/v1/spec_decode/test_suffix_automaton_proposer.py` — 完整测试套件
 
 #### 预期效果
 - 增量更新：每步 O(new_tokens) 而非 O(context_len) 重建
@@ -1129,8 +1116,7 @@ class AcceptanceTracker:
 
 #### 实际实现
 
-已实现文件：`vllm/v1/spec_decode/adaptive_suffix_proposer.py`（363 行）
-测试文件：`tests/v1/spec_decode/test_adaptive_suffix_proposer.py`（372 行）
+已实现文件：`vllm/v1/spec_decode/adaptive_suffix_proposer.py`
 
 实现要点：
 - `AdaptiveSuffixProposer` 继承 `SuffixAutomatonProposer`，复用增量 SAM 能力
@@ -1143,19 +1129,16 @@ class AcceptanceTracker:
   - `W_ACCEPT=0.30`：历史接受率（权重最高）
 - **跨级别最优选择**：遍历所有回退级别的所有候选，选全局最高分
 - **接受反馈闭环** `update_acceptance()`：记录上次提案的 (match_len, num_proposed)，接收 num_accepted 更新 tracker
-- `remove_request()` 清理 SAM + tracker + last_proposal 三份状态
+- `remove_request()` 清理 SAM + tracker + last_proposal 状态
+- **已接线到引擎**：`gpu_model_runner.py` 通过环境变量 `VLLM_SPEC_PROPOSER=adaptive` 启用，
+  并在每步 propose 前调用 `update_acceptance()` 形成反馈闭环
 
-测试覆盖（15 个测试用例）：
-- 基础匹配、无匹配、多候选偏好最近位置（验证 recency 评分有效）
-- 自适应回退、AcceptanceTracker 单元测试（含窗口滑动验证）
-- 接受反馈闭环验证、增量更新一致性、请求生命周期
-- 多请求独立性、20 轮增量 vs 重建压力测试
-- 200 轮随机数据匹配率对比（Adaptive ≥ SAM）
-- 大上下文性能基准（4000 tokens 初始构建 + 增量追加）
+> **测试说明（据实修正）**：`tests/v1/spec_decode/` 下暂**未包含**独立单元测试文件；
+> 正确性通过 A/B 压测与开发期冒烟验证保障，补充单测列入待办。
 
 #### 修改文件
 - 新增 `vllm/v1/spec_decode/adaptive_suffix_proposer.py` — `AdaptiveSuffixProposer` + `AcceptanceTracker`
-- 新增 `tests/v1/spec_decode/test_adaptive_suffix_proposer.py` — 完整测试套件
+- 改 `vllm/v1/worker/gpu_model_runner.py` — 接线 `VLLM_SPEC_PROPOSER=adaptive` + 反馈闭环
 
 #### 预期效果
 - 接受率提升：从"首次匹配"到"最优匹配"，预期接受率提升 15-30%
@@ -1169,7 +1152,7 @@ class AcceptanceTracker:
 
 ---
 
-### 优化点 4：跨请求共享后缀树 `[进阶]` `[方案设计 ⬜]`
+### 优化点 4：跨请求共享后缀树 `[进阶]` `[已实现 ✅（与优化点 6 合并）]`
 
 #### 问题分析
 
@@ -1320,9 +1303,20 @@ class HybridSuffixProposer(AdaptiveSuffixProposer):
         return draft
 ```
 
-#### 修改文件
-- `vllm/v1/spec_decode/suffix_proposer.py` — 新增 `GlobalSuffixPool` 和 `HybridSuffixProposer`
-- `vllm/v1/worker/gpu_model_runner.py` — 实例化全局池，验证后添加 accepted segments
+#### 实际实现（据实）
+
+> 跨请求共享**与优化点 6（频率筛选）合并实现**为一个组件——`FrequencyAwareGlobalSuffixPool`
+> （见优化点 6）。它同时提供"跨请求复用"（优化点 4 的目标）和"按接受频率筛选"（优化点 6 的目标）。
+> 设计稿里的 `GlobalSuffixPool` / `HybridSuffixProposer` 未单独保留，能力并入该合并组件。
+
+- 通过环境变量 `VLLM_SUFFIX_GLOBAL_POOL=1` 启用（默认关闭，向后兼容）。
+- 在 `AdaptiveSuffixProposer` 里：per-request SAM 未命中时**回退查询全局池**；请求接受 ≥3 token 的
+  续接时，通过 `record_accepted_segment()` 贡献给全局池供其他请求复用。
+
+#### 修改文件（据实）
+- 新增 `vllm/v1/spec_decode/global_suffix_pool.py` — `FrequencyAwareGlobalSuffixPool`（合并 4+6）
+- 改 `vllm/v1/spec_decode/adaptive_suffix_proposer.py` — 未命中回退全局池 + 贡献 accepted 片段
+- 改 `vllm/v1/worker/gpu_model_runner.py` — 每步调用 `record_accepted_segment()` 收集片段
 
 #### 预期效果
 - 短 context 请求也能利用全局模式产生高质量 draft
@@ -1336,7 +1330,7 @@ class HybridSuffixProposer(AdaptiveSuffixProposer):
 
 ---
 
-### 优化点 5：后缀解码效果量化与可观测性 `[辅助]` `[方案设计 ⬜]`
+### 优化点 5：后缀解码效果量化与可观测性 `[辅助]` `[已实现 ✅]`
 
 #### 问题分析
 
@@ -1419,10 +1413,21 @@ class SuffixDecodeMetrics:
         )
 ```
 
-#### 修改文件
-- `vllm/v1/spec_decode/suffix_proposer.py` — 在各方法中埋点
-- `vllm/v1/worker/gpu_model_runner.py` — 定期输出指标
-- 可选：集成到 vLLM 的 Prometheus metrics 中
+#### 实际实现（据实）
+
+已实现文件：`vllm/v1/spec_decode/suffix_metrics.py`（`SuffixDecodeMetrics` 数据类）。
+
+- 覆盖设计稿的全部指标：接受率、平均接受长度、匹配率、平均匹配长度、回退次数、多候选/最近命中、
+  全局池查询/命中/片段数、动态投机长度统计、树 draft 分支数，并提供 `report()` / `to_dict()`。
+- 埋点位置：`AdaptiveSuffixProposer` 的 `propose`/`_propose_single`/`update_acceptance`/`propose_tree`
+  中累加计数（纯 CPU、O(1)、不在 GPU 关键路径上）。
+- 输出：`gpu_model_runner.py` 的 `_maybe_log_suffix_metrics()` 每 `VLLM_SUFFIX_METRICS_INTERVAL`
+  步（默认 500，设 0 关闭）打一次 `logger.info` 报告。
+
+#### 修改文件（据实）
+- 新增 `vllm/v1/spec_decode/suffix_metrics.py` — `SuffixDecodeMetrics`
+- 改 `vllm/v1/spec_decode/adaptive_suffix_proposer.py` — 各方法埋点 + `get_metrics()`
+- 改 `vllm/v1/worker/gpu_model_runner.py` — `_maybe_log_suffix_metrics()` 定期输出
 
 #### 涉及的 vLLM 知识点
 - `SpecDecodeWorkerMetrics`（V0 中的指标类）如何收集和上报
@@ -1431,7 +1436,7 @@ class SuffixDecodeMetrics:
 
 ---
 
-### 优化点 6：全局后缀树 + 频率感知的 draft 质量筛选 `[进阶]` `[方案设计 ⬜]`
+### 优化点 6：全局后缀树 + 频率感知的 draft 质量筛选 `[进阶]` `[已实现 ✅]`
 
 > 参考业界后缀解码（SuffixDecoding 论文 / SGLang）的核心做法——**维护一个跨请求的全局后缀树**，
 > 并按"历史被接受频率"筛选高质量 draft。这是对优化点 4（跨请求共享池）的深化：不只是"共享匹配"，
@@ -1510,9 +1515,20 @@ class FrequencyAwareGlobalSuffixTree:
 2. **冷启动乐观估计**：没统计过的续接给 `len × 0.5` 的乐观值，让它有机会被试一次。
 3. **LRU + 频率双驱逐**：容量满时优先驱逐"低接受率 + 久未访问"的节点。
 
-#### 修改文件
-- `vllm/v1/spec_decode/adaptive_suffix_proposer.py` — 新增 `FrequencyAwareGlobalSuffixTree`
-- `vllm/v1/worker/gpu_model_runner.py` — 验证后回传 feedback
+#### 实际实现（据实）
+
+已实现文件：`vllm/v1/spec_decode/global_suffix_pool.py`（`FrequencyAwareGlobalSuffixPool`）。
+
+> 实现上采用 **pattern-key → 候选续接列表** 的索引（而非设计稿里"重建全局 SAM"的方式），
+> 更简单可靠、O(1) 查询、天然支持频率统计。每个候选记录 `proposed_count`/`accepted_tokens`，
+> 按 **期望收益 = 接受率 × 长度** 排序，低于 `min_expected_gain`（默认 0.3）直接不提案
+> （"宁可不投机，也不投低质量的"）；容量满时按 LRU + 低收益驱逐。冷启动用乐观估计。
+> 通过 `VLLM_SUFFIX_GLOBAL_POOL=1` 启用（与优化点 4 是同一组件）。
+
+#### 修改文件（据实）
+- 新增 `vllm/v1/spec_decode/global_suffix_pool.py` — `FrequencyAwareGlobalSuffixPool`
+- 改 `vllm/v1/spec_decode/adaptive_suffix_proposer.py` — 未命中回退查询 + `update_feedback` 回传
+- 改 `vllm/v1/worker/gpu_model_runner.py` — 每步收集 accepted 片段
 
 #### 预期效果
 - **无效投机减少**：低接受率的 draft 不再被提案，节省 GPU 验证开销
@@ -1520,7 +1536,7 @@ class FrequencyAwareGlobalSuffixTree:
 
 ---
 
-### 优化点 7：动态投机长度（负载感知的 draft 长度调节） `[进阶]` `[方案设计 ⬜]`
+### 优化点 7：动态投机长度（负载感知的 draft 长度调节） `[进阶]` `[已实现 ✅]`
 
 > 呼应你在调度优化里的思路——**投机解码的收益/开销随系统负载变化**，draft 长度应该动态调整，
 > 而不是固定 `num_speculative_tokens`。这是"后缀解码 × 调度"的跨模块协同点。
@@ -1576,9 +1592,18 @@ def _adaptive_spec_len(self, req_index: int, base_k: int) -> int:
 > 是**同一个负载信号**。可以理解为"投机长度"也成了一种受负载调控的资源——高负载时，
 > 调度器限低优请求的速率，投机模块限所有请求的 draft 长度，双管齐下保护系统。
 
-#### 修改文件
-- `vllm/v1/worker/gpu_model_runner.py` — `generate_draft_token_ids` 里按负载调 k
-- `vllm/v1/spec_decode/adaptive_suffix_proposer.py` — 暴露近期接受率查询
+#### 实际实现（据实）
+
+已实现于 `AdaptiveSuffixProposer._effective_k()` + `set_load()`：
+
+- `gpu_model_runner.py` 每步用 `set_load(num_running / max_num_reqs)` 传入系统负载；
+- `propose()` 对每个请求调 `_effective_k(req_id, base_k)`：按 load 档位（<0.5→×1.5，<0.8→×1.0，
+  否则 ×0.5）× 接受率因子（0.5+近期接受率）算出本步 k，clamp 到 `[0, 2·base_k]`；k=0 则本步跳过投机。
+- 通过 `VLLM_SUFFIX_DYNAMIC_K=1` 启用（默认关闭，则 k 恒为 base_k，行为不变）。
+
+#### 修改文件（据实）
+- 改 `vllm/v1/spec_decode/adaptive_suffix_proposer.py` — `set_load()` + `_effective_k()`
+- 改 `vllm/v1/worker/gpu_model_runner.py` — 每步传入 load 信号
 
 #### 预期效果
 - **高负载不再"投机拖累"**：避免失败投机挤占算力，高并发下吞吐更稳
@@ -1586,7 +1611,7 @@ def _adaptive_spec_len(self, req_index: int, base_k: int) -> int:
 
 ---
 
-### 优化点 8：一次性树状 draft 验证（多候选并行验证） `[进阶]` `[方案设计 ⬜]`
+### 优化点 8：一次性树状 draft 验证（多候选并行验证） `[进阶]` `[部分实现 ⚠️（多候选生成已实现，树验证受限）]`
 
 > 参考 xLLM 后缀解码"**将匹配到的后缀序列一次性喂给 Target Model 验证**"，以及树状投机解码思路。
 > 当前实现每步只提一条 draft 链；本优化让后缀结构产出**多条候选路径**，一次 forward 并行验证。
@@ -1627,9 +1652,23 @@ def propose_tree(self, context, n, k, req_index, max_branches=3):
 > 分析的 `propose_tree` + `TreeAttentionMetadataBuilder`）。本优化是**把后缀树的多候选接入这套树验证路径**，
 > 而不是从零实现树验证——工程上是"后缀 proposer + 官方树注意力"的对接。
 
-#### 修改文件
-- `vllm/v1/spec_decode/adaptive_suffix_proposer.py` — 新增 `propose_tree`
-- 对接 vLLM 树状投机的 `TreeAttentionMetadata` 构造
+#### 实际实现（据实，含限制说明）
+
+已实现 `AdaptiveSuffixProposer.propose_tree()`：产出**多条候选分支**（去重、按四因子评分排序、取
+top-`max_branches`），通过 `VLLM_SUFFIX_TREE=1` + `VLLM_SUFFIX_TREE_BRANCHES` 配置。
+
+> ⚠️ **关键限制（据实）**：**"多候选生成"已实现，但"一次 forward 的树注意力验证"未接通**。
+> 原因是 vLLM 官方的树验证基建（`TreeAttentionMetadataBuilder` + 模型侧 `propose_tree`，见
+> `vllm/v1/attention/backends/tree_attn.py` 和 `llm_base_proposer.py`）是为**模型型 drafter
+> （EAGLE 等，自带 GPU 前向 + `draft_attn_groups`）**设计的；而本项目的后缀 proposer 是**算法型
+> （走 ngram 路径、纯 CPU、不拥有 draft attention groups）**，无法直接驱动那套 GPU 树验证。
+> 真正接通需要 ngram 路径的 RejectionSampler 支持树 draft——这是更大的独立改动。
+> 因此 `propose_tree()` 当前作为**多候选生成/排序能力**提供（也可用作 ranked alternatives），
+> 树验证保持为后续工作。
+
+#### 修改文件（据实）
+- 改 `vllm/v1/spec_decode/adaptive_suffix_proposer.py` — 新增 `propose_tree()`（多候选生成）
+- 树注意力验证：受限，未接通（见上）
 
 #### 预期效果
 - **命中率大幅提升**：多押几条路，Target 命中其一即接受，尤其适合"续接有多种合理可能"的场景
@@ -1663,14 +1702,17 @@ def propose_tree(self, context, n, k, req_index, max_branches=3):
 
 | 阶段 | 优化点 | 优先级 | 预计工作量 | 核心收益 | 状态 |
 |------|--------|--------|-----------|---------|------|
-| 阶段 1 | 优化点 1：基础 SuffixTreeProposer | P0 | 中 | 替换 NgramProposer，验证可行性 | ✅ 已完成 |
+| 阶段 1 | 优化点 1：基础后缀匹配（并入 SAM） | P0 | 中 | 替换 NgramProposer，验证可行性 | ✅ 已完成（并入优化2） |
 | 阶段 2 | 优化点 2：增量 SAM | P0 | 大 | 核心性能优化，O(1) 增量更新 | ✅ 已完成 |
-| 阶段 3 | 优化点 5：可观测性 | P0 | 小 | 量化后续优化的效果 | ⬜ 未开始 |
+| 阶段 3 | 优化点 5：可观测性 | P0 | 小 | 量化后续优化的效果 | ✅ 已完成 |
 | 阶段 4 | 优化点 3：自适应匹配 + 评分 | P1 | 中 | 提升接受率 | ✅ 已完成 |
-| 阶段 5 | 优化点 4：跨请求共享池 | P2 | 大 | 多请求场景下的额外收益 | ⬜ 未开始 |
-| 阶段 6 | 优化点 6：全局树 + 频率筛选 | P2 | 大 | 按接受频率筛 draft，减少无效投机 | ⬜ 方案设计 |
-| 阶段 7 | 优化点 7：动态投机长度 | P1 | 中 | 负载感知调 k，高负载不拖累 | ⬜ 方案设计 |
-| 阶段 8 | 优化点 8：树状多候选验证 | P2 | 大 | 多押路径提命中率，接入树注意力 | ⬜ 方案设计 |
+| 阶段 5 | 优化点 4：跨请求共享池 | P2 | 大 | 多请求场景下的额外收益 | ✅ 已完成（并入优化6） |
+| 阶段 6 | 优化点 6：全局树 + 频率筛选 | P2 | 大 | 按接受频率筛 draft，减少无效投机 | ✅ 已完成 |
+| 阶段 7 | 优化点 7：动态投机长度 | P1 | 中 | 负载感知调 k，高负载不拖累 | ✅ 已完成 |
+| 阶段 8 | 优化点 8：树状多候选验证 | P2 | 大 | 多押路径提命中率，接入树注意力 | ⚠️ 部分（多候选生成✅ / 树验证受限） |
+
+> **测试补充待办**：以上已实现优化点当前主要靠 A/B 压测 + 开发期冒烟验证；
+> `tests/v1/spec_decode/` 下的独立单元测试尚待补充。
 
 ---
 
@@ -1683,7 +1725,7 @@ def propose_tree(self, context, n, k, req_index, max_branches=3):
 | 匹配成功率 | ~40-60%（固定 n 值） | ~70-85%（自适应回退） | 优化 3 ✅ |
 | 平均接受长度 | ~2-3 tokens | ~3-5 tokens | 优化 3 ✅ |
 | 每步有效 token 数 | ~1.5-2.0 | ~2.5-3.5 | 综合 |
-| 跨请求利用 | 无 | 有（全局池） | 优化 4 ⬜ |
+| 跨请求利用 | 无 | 有（全局池） | 优化 4/6 ✅ |
 
 **整体效果**：在重复性较高的场景（如对话服务、代码补全、模板化回答）中，Decode 阶段的每步有效 token 数从 ~1.5 提升到 ~3.0，等效于 2x 的 Decode 速度提升。
 
@@ -1719,11 +1761,11 @@ suffix-decoding-optimization.md（推理加速侧）：    ← 本文件
   后缀树 Proposer ────────────────── 更高效的 draft 生成              ✅ 已实现
   增量后缀自动机 ─────────────────── 跨步复用，O(1) 更新             ✅ 已实现
   自适应匹配 + 评分 ──────────────── 提升 draft 接受率               ✅ 已实现
-  跨请求共享 ─────────────────────── 全局模式利用                    ⬜ 方案设计
-  可观测性指标 ───────────────────── 量化优化效果                    ⬜ 方案设计
-  全局树 + 频率筛选 ──────────────── 按接受频率筛 draft 质量          ⬜ 方案设计
-  动态投机长度 ───────────────────── 负载感知调 k（与调度联动）        ⬜ 方案设计
-  树状多候选验证 ─────────────────── 多押路径提命中率                 ⬜ 方案设计
+  跨请求共享 ─────────────────────── 全局模式利用（并入频率筛选）      ✅ 已实现
+  可观测性指标 ───────────────────── 量化优化效果                    ✅ 已实现
+  全局树 + 频率筛选 ──────────────── 按接受频率筛 draft 质量          ✅ 已实现
+  动态投机长度 ───────────────────── 负载感知调 k（与调度联动）        ✅ 已实现
+  树状多候选验证 ─────────────────── 多押路径提命中率                 ⚠️ 多候选生成已实现/树验证受限
 
 三者协同：
   调度器 ─── 决定请求的优先级和运行速率

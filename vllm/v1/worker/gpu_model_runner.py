@@ -4526,6 +4526,27 @@ class GPUModelRunner(
         sampled_count_event.synchronize()
         return counts_cpu[: prev_sampled_token_ids.shape[0]].tolist()
 
+    def _maybe_log_suffix_metrics(self) -> None:
+        """Optimization 5: periodically log AdaptiveSuffixProposer metrics.
+
+        Logs a compact report every ``VLLM_SUFFIX_METRICS_INTERVAL`` proposal
+        steps (default 500; set 0 to disable). No-op unless the drafter is an
+        AdaptiveSuffixProposer.
+        """
+        interval = getattr(self, "_suffix_metrics_interval", None)
+        if interval is None:
+            interval = int(
+                os.environ.get("VLLM_SUFFIX_METRICS_INTERVAL", "500")
+            )
+            self._suffix_metrics_interval = interval
+            self._suffix_metrics_step = 0
+        if interval <= 0:
+            return
+        self._suffix_metrics_step += 1
+        if self._suffix_metrics_step % interval == 0:
+            metrics = self.drafter.get_metrics()
+            logger.info("SuffixDecode metrics:\n%s", metrics.report())
+
     def propose_draft_token_ids(
         self,
         scheduler_output: "SchedulerOutput",
@@ -4550,12 +4571,23 @@ class GPUModelRunner(
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, (NgramProposer, AdaptiveSuffixProposer))
             if isinstance(self.drafter, AdaptiveSuffixProposer):
+                # Optimization 7: feed current system load (running / max)
+                # so the proposer can scale speculation length dynamically.
+                num_running = len(self.input_batch.req_ids)
+                self.drafter.set_load(
+                    num_running / max(1, self.max_num_reqs)
+                )
                 # Feed acceptance feedback before proposing (per request).
                 for i, sampled_ids in enumerate(sampled_token_ids):
                     if len(sampled_ids) > 1:
                         req_id = self.input_batch.req_ids[i]
                         self.drafter.update_acceptance(
                             req_id, num_accepted=len(sampled_ids) - 1
+                        )
+                        # Optimization 4/6: contribute accepted runs to the
+                        # cross-request global pool (no-op if disabled).
+                        self.drafter.record_accepted_segment(
+                            np.asarray(sampled_ids, dtype=np.int32)
                         )
                 draft_token_ids = self.drafter.propose(
                     sampled_token_ids,
@@ -4564,6 +4596,8 @@ class GPUModelRunner(
                     slot_mappings=slot_mappings,
                     req_ids=self.input_batch.req_ids,
                 )
+                # Optimization 5: periodically log suffix-decode metrics.
+                self._maybe_log_suffix_metrics()
             else:
                 draft_token_ids = self.drafter.propose(
                     sampled_token_ids,
