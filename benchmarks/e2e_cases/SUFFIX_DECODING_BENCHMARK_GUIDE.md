@@ -199,24 +199,95 @@ proposer 耗时↑（SAM 构建） → 每 step 开销↑ → 吞吐↓
 
 > **控制变量提醒**：A/B 两轮必须除 `VLLM_SPEC_PROPOSER` 外**所有参数完全一致**（同数据集、同 k、同 QPS、同 seed、同上下文长度），否则对比无效。
 
-### 3.4 进阶优化点（6/7/8）的测试设计
+### 3.4 进阶优化点（6/7/8）的测试设计（基于真实实现状态）
 
-> 对应 [`suffix-decoding-optimization.md`](../basic_optimization/suffix-decoding-optimization.md) 新增的
-> 优化点 6（全局树+频率筛选）、7（动态投机长度）、8（树状多候选验证）。这些为方案设计，实现后按下表验证。
+> 先说明**实现状态核查结论**（2026-08-29 核实代码），这决定了哪些能测、哪些不能：
+>
+> | 优化点 | 代码存在 | 接线到推理主循环 | 可测试性 |
+> |--------|---------|-----------------|---------|
+> | 6 全局树+频率筛选 | ✅ `global_suffix_pool.py` | ✅ `propose` 里查池 + 接受段 `add_segment` 进池 | ✅ 可测（`VLLM_SUFFIX_GLOBAL_POOL=1`）|
+> | 7 动态投机长度 | ✅ `_effective_k()` + `set_load()` | ✅ `set_load` 每步调用；`_effective_k` 在 `propose` 里生效 | ✅ 可测（`VLLM_SUFFIX_DYNAMIC_K=1`）|
+> | 8 树状多候选 | ⚠️ `propose_tree()` 方法存在 | ❌ **未接线**——`gpu_model_runner.py` 不调用 `propose_tree`，`VLLM_SUFFIX_TREE=1` 只是设置标志，实际推理仍走单链 `propose` | ❌ **不可测**（需先接线）|
 
-| 轮次 | 被测优化 | 对照 | 数据集/负载 | 验证目标 | 关键指标 | 状态 |
-|------|---------|------|------------|---------|---------|------|
-| **8** | 优化6 全局树+频率筛选 | Adaptive（无全局池）vs +全局频率筛选 | sharegpt（多请求共享模板） | 频率筛选是否减少**无效投机**（低质量 draft 被拒） | 接受率、**无效投机率**（proposed 但 0 accept 的比例）、全局池命中率 | ⬜ 待做 |
-| **9** | 优化7 动态投机长度 | 固定 k=4 vs 负载感知动态 k | spec_bench，**QPS 10/50/100** | 高负载下动态 k 是否避免"投机拖累"（失败投机挤占算力） | 各负载下吞吐、TPOT、平均 draft 长度随负载变化 | ⬜ 待做 |
-| **10** | 优化8 树状多候选验证 | 单链 draft vs 树状多候选 | Agentic Coding / 代码补全（续接多可能） | 多押路径是否提升命中率 | 接受率、每步有效 token 数、**draft token 总量**（树更宽，看开销） | ⬜ 待做 |
+> ⚠️ **关键提醒**：优化点 8 目前**无法产生实际效果**（`propose_tree` 已实现但未被推理主循环调用）。
+> 设置 `VLLM_SUFFIX_TREE=1` 不会改变行为。要测它需先完成接线（见 §3.4.3）。
 
-#### 各轮次核心判据
+#### 3.4.1 优化点 6（全局树 + 频率筛选）——轮次 8
 
-- **轮次 8（频率筛选）**：核心看**无效投机率下降**——优化 6 的价值是"宁可不投机也不投低质量的"。若接受率持平但无效投机率下降，说明筛选生效（省了 GPU 验证开销）。
-- **轮次 9（动态 k）**：核心看**高负载区间**。低负载下动态 k 应≈固定 k；**高负载（QPS 100）下动态 k 应主动调小、吞吐不塌**，而固定 k=4 可能因失败投机挤占算力导致吞吐下降。对比两者在高负载的吞吐差。
-- **轮次 10（树状）**：核心看**命中率 vs 开销的权衡**。树状增加 draft token 总量（占更多 forward 算力），要验证"命中率提升收益 > 多验证 token 的开销"——低负载（有空闲算力）下收益应更明显，高负载下需配合优化 7 限制树宽。
+> 触发：`VLLM_SPEC_PROPOSER=adaptive VLLM_SUFFIX_GLOBAL_POOL=1`
+> 机制：跨请求共享"接受的续接片段"，按**期望收益 = 接受率 × 长度**筛选（低于 `min_expected_gain=0.3` 不提案）。
 
-> **共同要求**：轮次 8/9/10 都必须同时采集 §2.4 的 proposer 内部指标（尤其"无效投机率""平均 draft 长度"），否则无法归因。
+| 项 | 设计 |
+|----|------|
+| 对照 | Adaptive（无全局池）vs Adaptive + 全局池 |
+| 数据集/负载 | **sharegpt**（多请求共享模板，跨请求复用才有意义）或 `prefix_repetition`（前缀重复，天然共享）；QPS 10 |
+| 验证目标 | 频率筛选是否**减少无效投机**（proposed 但 0 accept 的比例） |
+| 关键指标 | 接受率、**无效投机率**（draft 提出但一个都没被接受的比例）、全局池命中率（`global_pool_hit_rate`）、全局池 segments 数 |
+| 内部指标来源 | `SuffixDecodeMetrics`：`Global Pool Hit`、`Multi-Candidate`、`Match Rate` |
+
+**核心判据**：优化 6 的价值是"宁可不投机也不投低质量的"。若接受率持平但**无效投机率下降**，说明筛选生效（省了 GPU 验证无效 draft 的开销）。`global_pool_hit_rate` 应随请求数累积而上升（池越用越准）。
+
+**启动命令**：
+```bash
+VLLM_SPEC_PROPOSER=adaptive VLLM_SUFFIX_GLOBAL_POOL=1 \
+    python -m vllm.entrypoints.openai.api_server \
+    --model Qwen/Qwen2.5-1.5B-Instruct --max-model-len 4096 \
+    --gpu-memory-utilization 0.85 \
+    --speculative-config '{"method":"ngram","prompt_lookup_max":3,"num_speculative_tokens":4}' \
+    --port 8000
+```
+
+#### 3.4.2 优化点 7（动态投机长度）——轮次 9
+
+> 触发：`VLLM_SPEC_PROPOSER=adaptive VLLM_SUFFIX_DYNAMIC_K=1`
+> 机制：`set_load()` 每步传入系统负载（running/max），`_effective_k()` 动态调 k：
+> - 轻负载（load<0.5）：k ×1.5（激进投机）
+> - 中负载（0.5-0.8）：k ×1.0
+> - 重负载（load>0.8）：k ×0.5（保守）
+
+| 项 | 设计 |
+|----|------|
+| 对照 | 固定 k=4（Adaptive 无动态）vs 动态 k（Adaptive + 动态）|
+| 数据集/负载 | spec_bench；**QPS 10 / 50 / 100**（重点看高负载）|
+| 验证目标 | 高负载下动态 k 是否避免"投机拖累"（失败投机挤占算力）|
+| 关键指标 | 各负载下吞吐、TPOT、平均 draft 长度（`avg_dyn_len`）、`dyn_len_zero_count`（k 调为 0 的次数）|
+| 内部指标来源 | `SuffixDecodeMetrics`：`Dyn Spec Len: avg=.., adjusts=.., skips(k=0)=..` |
+
+**核心判据**：低负载下动态 k 应 ≈ 固定 k（无回归）；**高负载（QPS 100）下动态 k 应主动调小（`skips(k=0)` 增加）、吞吐不塌**，而固定 k=4 可能因失败投机挤占算力导致吞吐下降。对比两者在高负载的吞吐差。
+
+**启动命令**：
+```bash
+VLLM_SPEC_PROPOSER=adaptive VLLM_SUFFIX_DYNAMIC_K=1 \
+    python -m vllm.entrypoints.openai.api_server \
+    --model Qwen/Qwen2.5-1.5B-Instruct --max-model-len 4096 \
+    --gpu-memory-utilization 0.85 \
+    --speculative-config '{"method":"ngram","prompt_lookup_max":3,"num_speculative_tokens":4}' \
+    --port 8000
+```
+
+#### 3.4.3 优化点 8（树状多候选）——先接线，暂不可测
+
+> ⚠️ **当前状态**：`AdaptiveSuffixProposer.propose_tree()` 已实现（生成多条候选分支），
+> 但 **`gpu_model_runner.py` 没有调用它**——`VLLM_SUFFIX_TREE=1` 只设置了 `_tree_enabled` 标志，
+> 实际推理仍走 `propose()` 单链路径。因此**设置该开关不会有任何效果**。
+
+**要测试优化点 8，需先完成两处接线**：
+
+1. 在 `propose_draft_token_ids()` 里，当 `VLLM_SUFFIX_TREE=1` 时调用 `propose_tree()` 得到多条分支；
+2. 让 vLLM 的 ngram spec-decode 路径（RejectionSampler）支持**多条分支的树状验证**——这是**更大、独立的工作**（参考优化文档：需接入 `TreeAttentionMetadataBuilder` 的 GPU 树验证，或改造 RejectionSampler 支持树 draft）。
+
+> 在接线完成前，**不建议跑优化点 8 的测试**（结果必然是无差异，因为代码没生效）。
+> 建议先将测试精力放在可测的优化点 6、7 上。
+
+#### 各轮次执行顺序建议
+
+| 优先级 | 轮次 | 被测 | 理由 |
+|--------|------|------|------|
+| 高 | 8 | 优化6 频率筛选 | 可测 + 针对"无效投机"这个第一轮暴露的核心问题 |
+| 高 | 9 | 优化7 动态k | 可测 + 针对高负载场景 |
+| 低 | 10 | 优化8 树状 | 需先接线，暂缓 |
+
+> **共同要求**：轮次 8/9 都必须同时采集 §2.4 的 proposer 内部指标（尤其"无效投机率""平均 draft 长度"），否则无法归因。
 
 ---
 
@@ -379,17 +450,14 @@ vllm bench serve \
 
 > 测试结果记录于此。
 
-- [x] A 基线（ngram）接受率 + 吞吐（§5.4，接受率 ~76%）
-- [x] B 优化（adaptive）接受率 + 吞吐（§5.4，接受率 ~74%）
+- [x] A 基线（ngram）接受率 + 吞吐（§5.4，prefix_repetition 接受率 ~76%）
+- [x] B 优化（adaptive）接受率 + 吞吐（§5.4，prefix_repetition 接受率 ~74%）
 - [x] 第一轮对比分析（prefix_repetition，优化无效，见 §5.4）
-- [ ] **落地 `SuffixDecodeMetrics` 埋点**（优化点5，§2.4）——归因前置条件
-- [ ] 第二轮：spec_bench 数据集（轮次2，§3.3）+ 采集 proposer 内部指标
-- [ ] 第三轮：sharegpt 数据集（轮次3，§3.3）
+- [x] spec_bench 数据集（轮次2，§3.3）已跑通，修复了 SpecBench.sample bug
+- [ ] **优化点 6 测试**（轮次8，§3.4.1）：`VLLM_SUFFIX_GLOBAL_POOL=1`，sharegpt，验证无效投机率下降
+- [ ] **优化点 7 测试**（轮次9，§3.4.2）：`VLLM_SUFFIX_DYNAMIC_K=1`，QPS 10/50/100，验证高负载吞吐不塌
+- [ ] 优化点 8 测试（§3.4.3）：**需先接线 `propose_tree` 到推理主循环**，暂不可测
+- [ ] 第三轮：sharegpt 数据集（轮次3，§3.3）基础对比
 - [ ] k 扫描实验（k=2/4/8，轮次5）——验证长 draft 场景优势
 - [ ] 上下文长度对照（512 vs 4K，轮次6）——验证增量 SAM 价值
-- [ ] 并发扫描（QPS 10/50/100，轮次7）——proposer 开销占比归因
-- [ ] 补测 proposer 独立耗时（SAM 构建/查询，§2.4）——净收益归因
 - [ ] 结论：优化在什么数据集/k/上下文/负载下有效（有边界的诚实结论）
-- [ ] （进阶）轮次8：优化6 全局树+频率筛选——验证无效投机率下降（§3.4）
-- [ ] （进阶）轮次9：优化7 动态投机长度——验证高负载不投机拖累（§3.4）
-- [ ] （进阶）轮次10：优化8 树状多候选验证——验证命中率 vs 开销权衡（§3.4）

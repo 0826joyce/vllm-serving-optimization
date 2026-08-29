@@ -2364,14 +2364,6 @@ class SpecBench(CustomDataset):
         if not getattr(self, "disable_shuffle", False):
             random.shuffle(self.data)
 
-    def sample(
-        **kwargs,
-    ) -> list[SampleRequest]:
-        # leverage CustomDataset sample
-        return super().sample(
-            **kwargs,
-        )
-
 
 # -----------------------------------------------------------------------------
 # Sonnet Dataset Implementation
