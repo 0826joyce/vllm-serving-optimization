@@ -1152,7 +1152,7 @@ class AcceptanceTracker:
 
 ---
 
-### 优化点 4：跨请求共享后缀树 `[进阶]` `[已实现 ✅（与优化点 6 合并）]`
+### 优化点 4：跨请求共享 + 频率感知筛选 `[进阶]` `[已实现 ✅]`
 
 #### 问题分析
 
@@ -1305,16 +1305,19 @@ class HybridSuffixProposer(AdaptiveSuffixProposer):
 
 #### 实际实现（据实）
 
-> 跨请求共享**与优化点 6（频率筛选）合并实现**为一个组件——`FrequencyAwareGlobalSuffixPool`
-> （见优化点 6）。它同时提供"跨请求复用"（优化点 4 的目标）和"按接受频率筛选"（优化点 6 的目标）。
-> 设计稿里的 `GlobalSuffixPool` / `HybridSuffixProposer` 未单独保留，能力并入该合并组件。
+> 跨请求共享**与频率感知筛选合并实现**为一个组件——`FrequencyAwareGlobalSuffixPool`
+> （文件 `vllm/v1/spec_decode/global_suffix_pool.py`）。它同时提供"跨请求复用"和
+> "按接受频率筛选"两个能力。
 
 - 通过环境变量 `VLLM_SUFFIX_GLOBAL_POOL=1` 启用（默认关闭，向后兼容）。
 - 在 `AdaptiveSuffixProposer` 里：per-request SAM 未命中时**回退查询全局池**；请求接受 ≥3 token 的
-  续接时，通过 `record_accepted_segment()` 贡献给全局池供其他请求复用。
+  续接时，贡献给全局池供其他请求复用。
+- **频率感知筛选**：每个候选记录 `proposed_count` / `accepted_tokens`，按
+  **期望收益 = 接受率 × 长度** 排序，低于 `min_expected_gain`（默认 0.3）直接不提案
+  （"宁可不投机，也不投低质量的"）；容量满时按 LRU + 低收益驱逐。冷启动用乐观估计。
 
 #### 修改文件（据实）
-- 新增 `vllm/v1/spec_decode/global_suffix_pool.py` — `FrequencyAwareGlobalSuffixPool`（合并 4+6）
+- 新增 `vllm/v1/spec_decode/global_suffix_pool.py` — `FrequencyAwareGlobalSuffixPool`
 - 改 `vllm/v1/spec_decode/adaptive_suffix_proposer.py` — 未命中回退全局池 + 贡献 accepted 片段
 - 改 `vllm/v1/worker/gpu_model_runner.py` — 每步调用 `record_accepted_segment()` 收集片段
 
@@ -1322,6 +1325,10 @@ class HybridSuffixProposer(AdaptiveSuffixProposer):
 - 短 context 请求也能利用全局模式产生高质量 draft
 - 对话模板场景下的接受率大幅提升
 - 冷启动请求（刚进入系统的）也能立即获得 draft
+
+> ⚠️ **实测结论（2026-08-29）**：在 `prefix_repetition` 数据集下，全局池命中率仅 4.9%、
+> 接受率 -6pp，**价值有限**——原因是该数据集"前缀共享但生成内容不共享"。跨请求共享的价值
+> 需要在"真正共享生成内容"的场景（如多用户问相同问题、代码库复用）才能体现。
 
 #### 涉及的 vLLM 知识点
 - `input_batch` 的批次管理：多个请求在同一个 batch 中如何组织
@@ -1436,106 +1443,6 @@ class SuffixDecodeMetrics:
 
 ---
 
-### 优化点 6：全局后缀树 + 频率感知的 draft 质量筛选 `[进阶]` `[已实现 ✅]`
-
-> 参考业界后缀解码（SuffixDecoding 论文 / SGLang）的核心做法——**维护一个跨请求的全局后缀树**，
-> 并按"历史被接受频率"筛选高质量 draft。这是对优化点 4（跨请求共享池）的深化：不只是"共享匹配"，
-> 而是"**基于全局统计的频率感知筛选**"。
-
-#### 问题分析
-
-优化点 4 的全局池只做了"有没有匹配"，但没有解决一个关键问题：**全局池里的片段质量参差不齐**。
-
-```
-全局池里有两个都能匹配 pattern ["今天", "天气"] 的续接：
-  片段 A: ["很好", "，", "适合"]     ← 历史被接受 95 次，拒绝 5 次（高质量）
-  片段 B: ["不好", "说", "，"]       ← 历史被接受 2 次，拒绝 50 次（低质量，可能是噪声）
-
-当前只按"续接最长/位置最近"选，可能选中 B → draft 被拒 → 白白浪费一次投机
-```
-
-**根因**：draft 的价值 = 它**被 Target 接受的概率** × 长度。全局池必须记录每个片段的**历史接受频率**，用它来筛选，而不是盲目按长度/位置选。
-
-#### 设计方案
-
-**为全局后缀树的每个"可续接节点"维护频率统计，按 `接受率 × 长度` 的期望收益排序：**
-
-```python
-@dataclass
-class GlobalSuffixNode:
-    """全局后缀树节点，带频率统计。"""
-    continuation: np.ndarray        # 该节点对应的续接 token 序列
-    proposed_count: int = 0         # 作为 draft 被提案的次数
-    accepted_tokens: int = 0        # 累计被接受的 token 数
-    last_access_step: int = 0       # 最近一次被访问的全局 step（用于 LRU）
-
-    @property
-    def expected_gain(self) -> float:
-        """期望收益 = 平均每次提案能被接受的 token 数。"""
-        if self.proposed_count == 0:
-            return len(self.continuation) * 0.5   # 冷启动：乐观估计
-        return self.accepted_tokens / self.proposed_count
-
-
-class FrequencyAwareGlobalSuffixTree:
-    """全局后缀树 + 频率感知筛选。
-
-    与优化点 4 GlobalSuffixPool 的区别：
-    - 池：只存片段、按长度/位置选
-    - 本方案：存"续接 + 频率统计"，按期望收益（接受率×长度）选
-    """
-
-    def __init__(self, max_nodes: int = 20000, min_accept_rate: float = 0.3):
-        self.max_nodes = max_nodes
-        self.min_accept_rate = min_accept_rate       # 低于此接受率的续接不作为 draft
-        self._sam = IncrementalSuffixAutomaton()      # 复用增量 SAM 做匹配
-        self._node_stats: dict[int, GlobalSuffixNode] = {}   # SAM node_id → 统计
-
-    def query(self, pattern: np.ndarray, k: int) -> Optional[np.ndarray]:
-        """匹配 pattern，在所有候选续接里选期望收益最高的。"""
-        candidates = self._sam.find_all_continuations(pattern, k)   # 所有匹配的续接
-        best = None
-        best_gain = self.min_accept_rate    # 低于阈值直接不提案（宁可不投机）
-        for node_id, continuation in candidates:
-            stat = self._node_stats.get(node_id)
-            gain = stat.expected_gain if stat else len(continuation) * 0.5
-            if gain > best_gain:
-                best_gain, best = gain, continuation[:k]
-        return best
-
-    def update_feedback(self, node_id: int, proposed: int, accepted: int):
-        """RejectionSampler 结果回来后，更新该续接的频率统计。"""
-        stat = self._node_stats.setdefault(node_id, GlobalSuffixNode(...))
-        stat.proposed_count += 1
-        stat.accepted_tokens += accepted
-```
-
-**关键设计**：
-1. **期望收益筛选**：`expected_gain = accepted_tokens / proposed_count`，只提案期望收益 > 阈值的 draft——**宁可不投机，也不投低质量的**（避免无效投机开销）。
-2. **冷启动乐观估计**：没统计过的续接给 `len × 0.5` 的乐观值，让它有机会被试一次。
-3. **LRU + 频率双驱逐**：容量满时优先驱逐"低接受率 + 久未访问"的节点。
-
-#### 实际实现（据实）
-
-已实现文件：`vllm/v1/spec_decode/global_suffix_pool.py`（`FrequencyAwareGlobalSuffixPool`）。
-
-> 实现上采用 **pattern-key → 候选续接列表** 的索引（而非设计稿里"重建全局 SAM"的方式），
-> 更简单可靠、O(1) 查询、天然支持频率统计。每个候选记录 `proposed_count`/`accepted_tokens`，
-> 按 **期望收益 = 接受率 × 长度** 排序，低于 `min_expected_gain`（默认 0.3）直接不提案
-> （"宁可不投机，也不投低质量的"）；容量满时按 LRU + 低收益驱逐。冷启动用乐观估计。
-> 通过 `VLLM_SUFFIX_GLOBAL_POOL=1` 启用（与优化点 4 是同一组件）。
-
-#### 修改文件（据实）
-- 新增 `vllm/v1/spec_decode/global_suffix_pool.py` — `FrequencyAwareGlobalSuffixPool`
-- 改 `vllm/v1/spec_decode/adaptive_suffix_proposer.py` — 未命中回退查询 + `update_feedback` 回传
-- 改 `vllm/v1/worker/gpu_model_runner.py` — 每步收集 accepted 片段
-
-#### 预期效果
-- **无效投机减少**：低接受率的 draft 不再被提案，节省 GPU 验证开销
-- **Agentic/代码场景收益大**：这类场景重复模式多但也有噪声，频率筛选能挑出真正高频的模板
-
----
-
 ### 优化点 7：动态投机长度（负载感知的 draft 长度调节） `[进阶]` `[已实现 ✅]`
 
 > 呼应你在调度优化里的思路——**投机解码的收益/开销随系统负载变化**，draft 长度应该动态调整，
@@ -1611,69 +1518,6 @@ def _adaptive_spec_len(self, req_index: int, base_k: int) -> int:
 
 ---
 
-### 优化点 8：一次性树状 draft 验证（多候选并行验证） `[进阶]` `[部分实现 ⚠️（多候选生成已实现，树验证受限）]`
-
-> 参考 xLLM 后缀解码"**将匹配到的后缀序列一次性喂给 Target Model 验证**"，以及树状投机解码思路。
-> 当前实现每步只提一条 draft 链；本优化让后缀结构产出**多条候选路径**，一次 forward 并行验证。
-
-#### 问题分析
-
-当前后缀匹配即使找到多个候选，最终**只选一条**作为 draft（优化点 3 的评分选最优）：
-
-```
-pattern ["写", "一个"] 在历史里有 3 种续接：
-  候选 A: ["函数", "来", "计算"]
-  候选 B: ["Python", "脚本"]
-  候选 C: ["类", "，", "包含"]
-
-当前：评分选 1 条（比如 A）→ 如果 Target 其实想生成 B → A 被拒 → 白投机
-理想：A/B/C 三条一起喂给 Target 验证 → Target 命中哪条就接受哪条 → 命中率大增
-```
-
-**根因**：单链 draft 是"押一条路"，多候选并行验证是"押多条路，中一条就赚"。后缀结构天然能提供多候选（不同匹配位置的不同续接），浪费了可惜。
-
-#### 设计方案
-
-**用后缀树的多个续接构造 draft 树，用树注意力（tree attention）一次性验证：**
-
-```python
-def propose_tree(self, context, n, k, req_index, max_branches=3):
-    """产出树状 draft：多条候选路径。"""
-    sam = self._automata[req_index]
-    pattern = context[-n:]
-    # 取期望收益最高的 max_branches 条续接（复用优化点6的频率统计）
-    continuations = sam.find_top_continuations(pattern, k, top=max_branches)
-    # 构造 draft 树：共享前缀合并，分叉处成为树的分支
-    draft_tree = build_prefix_tree(continuations)
-    return draft_tree    # 交给 tree attention 验证（复用 vLLM 树状投机的验证路径）
-```
-
-> **实现依赖**：vLLM V1 已有**树状投机解码的验证基础设施**（见 `code_fitting/05_speculative_decoding_tree.md`
-> 分析的 `propose_tree` + `TreeAttentionMetadataBuilder`）。本优化是**把后缀树的多候选接入这套树验证路径**，
-> 而不是从零实现树验证——工程上是"后缀 proposer + 官方树注意力"的对接。
-
-#### 实际实现（据实，含限制说明）
-
-已实现 `AdaptiveSuffixProposer.propose_tree()`：产出**多条候选分支**（去重、按四因子评分排序、取
-top-`max_branches`），通过 `VLLM_SUFFIX_TREE=1` + `VLLM_SUFFIX_TREE_BRANCHES` 配置。
-
-> ⚠️ **关键限制（据实）**：**"多候选生成"已实现，但"一次 forward 的树注意力验证"未接通**。
-> 原因是 vLLM 官方的树验证基建（`TreeAttentionMetadataBuilder` + 模型侧 `propose_tree`，见
-> `vllm/v1/attention/backends/tree_attn.py` 和 `llm_base_proposer.py`）是为**模型型 drafter
-> （EAGLE 等，自带 GPU 前向 + `draft_attn_groups`）**设计的；而本项目的后缀 proposer 是**算法型
-> （走 ngram 路径、纯 CPU、不拥有 draft attention groups）**，无法直接驱动那套 GPU 树验证。
-> 真正接通需要 ngram 路径的 RejectionSampler 支持树 draft——这是更大的独立改动。
-> 因此 `propose_tree()` 当前作为**多候选生成/排序能力**提供（也可用作 ranked alternatives），
-> 树验证保持为后续工作。
-
-#### 修改文件（据实）
-- 改 `vllm/v1/spec_decode/adaptive_suffix_proposer.py` — 新增 `propose_tree()`（多候选生成）
-- 树注意力验证：受限，未接通（见上）
-
-#### 预期效果
-- **命中率大幅提升**：多押几条路，Target 命中其一即接受，尤其适合"续接有多种合理可能"的场景
-- **代价**：draft token 数增多（树比链宽），高负载下需配合优化点 7 控制树的宽度
-
 ---
 
 ## 四、实现路线图与依赖关系
@@ -1687,13 +1531,9 @@ top-`max_branches`），通过 `VLLM_SUFFIX_TREE=1` + `VLLM_SUFFIX_TREE_BRANCHES
     ↓
 优化点 3 (自适应匹配 + 评分)  ←── 核心质量提升
     │
-    ├──→ 优化点 4 (跨请求共享池)  ←── 进阶
-    │        │
-    │        └──→ 优化点 6 (全局树 + 频率筛选)  ←── 深化：按接受频率筛 draft 质量
+    ├──→ 优化点 4 (跨请求共享 + 频率感知筛选)  ←── 进阶：共享匹配 + 按接受频率筛质量
     │
     ├──→ 优化点 7 (动态投机长度)  ←── 进阶：负载感知，与调度联动
-    │
-    ├──→ 优化点 8 (树状多候选验证)  ←── 进阶：多押路径，接入树注意力
     │
     └──→ 优化点 5 (可观测性)  ←── 辅助所有优化的效果验证
 ```
@@ -1706,10 +1546,8 @@ top-`max_branches`），通过 `VLLM_SUFFIX_TREE=1` + `VLLM_SUFFIX_TREE_BRANCHES
 | 阶段 2 | 优化点 2：增量 SAM | P0 | 大 | 核心性能优化，O(1) 增量更新 | ✅ 已完成 |
 | 阶段 3 | 优化点 5：可观测性 | P0 | 小 | 量化后续优化的效果 | ✅ 已完成 |
 | 阶段 4 | 优化点 3：自适应匹配 + 评分 | P1 | 中 | 提升接受率 | ✅ 已完成 |
-| 阶段 5 | 优化点 4：跨请求共享池 | P2 | 大 | 多请求场景下的额外收益 | ✅ 已完成（并入优化6） |
-| 阶段 6 | 优化点 6：全局树 + 频率筛选 | P2 | 大 | 按接受频率筛 draft，减少无效投机 | ✅ 已完成 |
-| 阶段 7 | 优化点 7：动态投机长度 | P1 | 中 | 负载感知调 k，高负载不拖累 | ✅ 已完成 |
-| 阶段 8 | 优化点 8：树状多候选验证 | P2 | 大 | 多押路径提命中率，接入树注意力 | ⚠️ 部分（多候选生成✅ / 树验证受限） |
+| 阶段 5 | 优化点 4：跨请求共享 + 频率感知筛选 | P2 | 大 | 多请求共享 + 按接受频率筛 draft | ✅ 已完成 |
+| 阶段 6 | 优化点 7：动态投机长度 | P1 | 中 | 负载感知调 k，高负载不拖累 | ✅ 已完成 |
 
 > **测试补充待办**：以上已实现优化点当前主要靠 A/B 压测 + 开发期冒烟验证；
 > `tests/v1/spec_decode/` 下的独立单元测试尚待补充。
@@ -1725,13 +1563,13 @@ top-`max_branches`），通过 `VLLM_SUFFIX_TREE=1` + `VLLM_SUFFIX_TREE_BRANCHES
 | 匹配成功率 | ~40-60%（固定 n 值） | ~70-85%（自适应回退） | 优化 3 ✅ |
 | 平均接受长度 | ~2-3 tokens | ~3-5 tokens | 优化 3 ✅ |
 | 每步有效 token 数 | ~1.5-2.0 | ~2.5-3.5 | 综合 |
-| 跨请求利用 | 无 | 有（全局池） | 优化 4/6 ✅ |
+| 跨请求利用 | 无 | 有（全局池 + 频率筛选） | 优化 4 ✅ |
 
 **整体效果**：在重复性较高的场景（如对话服务、代码补全、模板化回答）中，Decode 阶段的每步有效 token 数从 ~1.5 提升到 ~3.0，等效于 2x 的 Decode 速度提升。
 
 ## 六、学习价值
 
-通过这 5 个优化点的实现，你将深入理解：
+通过这 6 个优化点的实现，你将深入理解：
 
 1. **vLLM V1 投机解码全链路**：Scheduler → ModelRunner → Forward → RejectionSampler → Proposer 的完整数据流
 2. **NgramProposer 的 KMP 实现**：Numba JIT 加速、numpy 数组操作
@@ -1761,11 +1599,9 @@ suffix-decoding-optimization.md（推理加速侧）：    ← 本文件
   后缀树 Proposer ────────────────── 更高效的 draft 生成              ✅ 已实现
   增量后缀自动机 ─────────────────── 跨步复用，O(1) 更新             ✅ 已实现
   自适应匹配 + 评分 ──────────────── 提升 draft 接受率               ✅ 已实现
-  跨请求共享 ─────────────────────── 全局模式利用（并入频率筛选）      ✅ 已实现
+  跨请求共享 + 频率筛选 ──────────── 全局模式利用 + 按接受频率筛质量    ✅ 已实现
   可观测性指标 ───────────────────── 量化优化效果                    ✅ 已实现
-  全局树 + 频率筛选 ──────────────── 按接受频率筛 draft 质量          ✅ 已实现
   动态投机长度 ───────────────────── 负载感知调 k（与调度联动）        ✅ 已实现
-  树状多候选验证 ─────────────────── 多押路径提命中率                 ⚠️ 多候选生成已实现/树验证受限
 
 三者协同：
   调度器 ─── 决定请求的优先级和运行速率

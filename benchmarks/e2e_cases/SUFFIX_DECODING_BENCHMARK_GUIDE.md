@@ -199,45 +199,16 @@ proposer 耗时↑（SAM 构建） → 每 step 开销↑ → 吞吐↓
 
 > **控制变量提醒**：A/B 两轮必须除 `VLLM_SPEC_PROPOSER` 外**所有参数完全一致**（同数据集、同 k、同 QPS、同 seed、同上下文长度），否则对比无效。
 
-### 3.4 进阶优化点（6/7/8）的测试设计（基于真实实现状态）
+### 3.4 进阶优化点（7 动态投机长度）的测试设计
 
-> 先说明**实现状态核查结论**（2026-08-29 核实代码），这决定了哪些能测、哪些不能：
+> 说明：优化文档（`suffix-decoding-optimization.md`）已精简为 6 个优化点
+> （1/2/3/4/5/7）。其中进阶优化点仅保留**优化点 7（动态投机长度）**——
+> 它是经测试确认有效且可测的进阶优化。
 >
-> | 优化点 | 代码存在 | 接线到推理主循环 | 可测试性 |
-> |--------|---------|-----------------|---------|
-> | 6 全局树+频率筛选 | ✅ `global_suffix_pool.py` | ✅ `propose` 里查池 + 接受段 `add_segment` 进池 | ✅ 可测（`VLLM_SUFFIX_GLOBAL_POOL=1`）|
-> | 7 动态投机长度 | ✅ `_effective_k()` + `set_load()` | ✅ `set_load` 每步调用；`_effective_k` 在 `propose` 里生效 | ✅ 可测（`VLLM_SUFFIX_DYNAMIC_K=1`）|
-> | 8 树状多候选 | ⚠️ `propose_tree()` 方法存在 | ❌ **未接线**——`gpu_model_runner.py` 不调用 `propose_tree`，`VLLM_SUFFIX_TREE=1` 只是设置标志，实际推理仍走单链 `propose` | ❌ **不可测**（需先接线）|
+> （跨请求共享 + 频率筛选已合并为优化点 4，实测在 `prefix_repetition` 下价值有限；
+> 优化点 8 树状多候选已从优化文档移除。两者均不再纳入测试。）
 
-> ⚠️ **关键提醒**：优化点 8 目前**无法产生实际效果**（`propose_tree` 已实现但未被推理主循环调用）。
-> 设置 `VLLM_SUFFIX_TREE=1` 不会改变行为。要测它需先完成接线（见 §3.4.3）。
-
-#### 3.4.1 优化点 6（全局树 + 频率筛选）——轮次 8
-
-> 触发：`VLLM_SPEC_PROPOSER=adaptive VLLM_SUFFIX_GLOBAL_POOL=1`
-> 机制：跨请求共享"接受的续接片段"，按**期望收益 = 接受率 × 长度**筛选（低于 `min_expected_gain=0.3` 不提案）。
-
-| 项 | 设计 |
-|----|------|
-| 对照 | Adaptive（无全局池）vs Adaptive + 全局池 |
-| 数据集/负载 | **sharegpt**（多请求共享模板，跨请求复用才有意义）或 `prefix_repetition`（前缀重复，天然共享）；QPS 10 |
-| 验证目标 | 频率筛选是否**减少无效投机**（proposed 但 0 accept 的比例） |
-| 关键指标 | 接受率、**无效投机率**（draft 提出但一个都没被接受的比例）、全局池命中率（`global_pool_hit_rate`）、全局池 segments 数 |
-| 内部指标来源 | `SuffixDecodeMetrics`：`Global Pool Hit`、`Multi-Candidate`、`Match Rate` |
-
-**核心判据**：优化 6 的价值是"宁可不投机也不投低质量的"。若接受率持平但**无效投机率下降**，说明筛选生效（省了 GPU 验证无效 draft 的开销）。`global_pool_hit_rate` 应随请求数累积而上升（池越用越准）。
-
-**启动命令**：
-```bash
-VLLM_SPEC_PROPOSER=adaptive VLLM_SUFFIX_GLOBAL_POOL=1 \
-    python -m vllm.entrypoints.openai.api_server \
-    --model Qwen/Qwen2.5-1.5B-Instruct --max-model-len 4096 \
-    --gpu-memory-utilization 0.85 \
-    --speculative-config '{"method":"ngram","prompt_lookup_max":3,"num_speculative_tokens":4}' \
-    --port 8000
-```
-
-#### 3.4.2 优化点 7（动态投机长度）——轮次 9
+#### 3.4.1 优化点 7（动态投机长度）——轮次 9
 
 > 触发：`VLLM_SPEC_PROPOSER=adaptive VLLM_SUFFIX_DYNAMIC_K=1`
 > 机制：`set_load()` 每步传入系统负载（running/max），`_effective_k()` 动态调 k：
@@ -248,12 +219,13 @@ VLLM_SPEC_PROPOSER=adaptive VLLM_SUFFIX_GLOBAL_POOL=1 \
 | 项 | 设计 |
 |----|------|
 | 对照 | 固定 k=4（Adaptive 无动态）vs 动态 k（Adaptive + 动态）|
-| 数据集/负载 | spec_bench；**QPS 10 / 50 / 100**（重点看高负载）|
+| 数据集/负载 | spec_bench / prefix_repetition；**QPS 10（低）/ 50（高）** |
 | 验证目标 | 高负载下动态 k 是否避免"投机拖累"（失败投机挤占算力）|
-| 关键指标 | 各负载下吞吐、TPOT、平均 draft 长度（`avg_dyn_len`）、`dyn_len_zero_count`（k 调为 0 的次数）|
+| 关键指标 | 各负载下吞吐、TPOT、平均 draft 长度（avg_dyn_len）、dyn_len_zero_count（k 调为 0 的次数）|
 | 内部指标来源 | `SuffixDecodeMetrics`：`Dyn Spec Len: avg=.., adjusts=.., skips(k=0)=..` |
 
-**核心判据**：低负载下动态 k 应 ≈ 固定 k（无回归）；**高负载（QPS 100）下动态 k 应主动调小（`skips(k=0)` 增加）、吞吐不塌**，而固定 k=4 可能因失败投机挤占算力导致吞吐下降。对比两者在高负载的吞吐差。
+**核心判据**：低负载下动态 k 应 ≈ 固定 k（无回归）；**高负载下动态 k 应主动调小、吞吐不塌**，
+而固定 k=4 可能因失败投机挤占算力导致吞吐下降。
 
 **启动命令**：
 ```bash
@@ -265,61 +237,15 @@ VLLM_SPEC_PROPOSER=adaptive VLLM_SUFFIX_DYNAMIC_K=1 \
     --port 8000
 ```
 
-#### 3.4.3 优化点 8（树状多候选）——先接线，暂不可测
+#### 执行顺序建议
 
-> ⚠️ **当前状态**：`AdaptiveSuffixProposer.propose_tree()` 已实现（生成多条候选分支），
-> 但 **`gpu_model_runner.py` 没有调用它**——`VLLM_SUFFIX_TREE=1` 只设置了 `_tree_enabled` 标志，
-> 实际推理仍走 `propose()` 单链路径。因此**设置该开关不会有任何效果**。
+| 优先级 | 被测 | 理由 |
+|--------|------|------|
+| 高 | 优化7 动态k（低负载） | 验证无回归 + 激进投机收益 |
+| 高 | 优化7 动态k（高负载） | 验证高负载吞吐不塌 |
 
-**要测试优化点 8，需先完成两处接线**：
+> **共同要求**：每轮都需同时采集 §2.4 的 proposer 内部指标（尤其"平均 draft 长度""无效投机率"），否则无法归因。
 
-1. 在 `propose_draft_token_ids()` 里，当 `VLLM_SUFFIX_TREE=1` 时调用 `propose_tree()` 得到多条分支；
-2. 让 vLLM 的 ngram spec-decode 路径（RejectionSampler）支持**多条分支的树状验证**——这是**更大、独立的工作**（参考优化文档：需接入 `TreeAttentionMetadataBuilder` 的 GPU 树验证，或改造 RejectionSampler 支持树 draft）。
-
-> 在接线完成前，**不建议跑优化点 8 的测试**（结果必然是无差异，因为代码没生效）。
-> 建议先将测试精力放在可测的优化点 6、7 上。
-
-#### 3.4.4 优化点 6 + 7 叠加（作为"完整版 Adaptive"大优化点）——轮次 11
-
-> 现实部署中，用户会把所有生效的优化开关都打开。因此除了分别测 6、7，
-> 还需要测"**6+7 叠加**"作为**完整版 Adaptive**，与基础版 Adaptive（1/2/3）对比，
-> 评估"全部增强一起开"是否有净增益。
-
-| 项 | 设计 |
-|----|------|
-| 触发 | `VLLM_SPEC_PROPOSER=adaptive VLLM_SUFFIX_GLOBAL_POOL=1 VLLM_SUFFIX_DYNAMIC_K=1` |
-| 对照 | 基础版 Adaptive（`VLLM_SPEC_PROPOSER=adaptive`，优化1/2/3）vs 完整版（+6/7） |
-| 数据集/负载 | **高负载（QPS 50/100）**——让优化 7（动态 k）在负载波动下生效；数据集优先**能体现跨请求共享**的场景（使优化 6 有发挥空间）|
-| 验证目标 | 6+7 叠加是否比基础版有净增益（接受率↑ 或 吞吐↑、延迟↓）|
-| 关键指标 | 接受率、吞吐、TPOT/TTFT、平均 draft 长度（`avg_dyn_len`）、全局池命中率 |
-| 内部指标来源 | `SuffixDecodeMetrics`（`Global Pool Hit`、`Dyn Spec Len`、`Match Rate` 等）|
-
-**核心判据**：
-- 若完整版在**高负载下吞吐/延迟优于基础版**（优化 7 的负载自适应 + 优化 6 的减少无效投机），则叠加有效；
-- 若与基础版持平或更差，说明 6/7 的叠加在当前负载/数据集下无净收益，需定位是 6 还是 7 拖累。
-
-> ⚠️ **注意优化点 8 不计入**：因未接线，`VLLM_SUFFIX_TREE=1` 无实际效果，不要把它加进"完整版"，否则结论会误导。
-
-**启动命令**（完整版）：
-```bash
-VLLM_SPEC_PROPOSER=adaptive VLLM_SUFFIX_GLOBAL_POOL=1 VLLM_SUFFIX_DYNAMIC_K=1 \
-    python -m vllm.entrypoints.openai.api_server \
-    --model Qwen/Qwen2.5-1.5B-Instruct --max-model-len 4096 \
-    --gpu-memory-utilization 0.85 \
-    --speculative-config '{"method":"ngram","prompt_lookup_max":3,"num_speculative_tokens":4}' \
-    --port 8000
-```
-
-#### 各轮次执行顺序建议
-
-| 优先级 | 轮次 | 被测 | 理由 |
-|--------|------|------|------|
-| 高 | 8 | 优化6 频率筛选（单独） | 可测 + 针对"无效投机"核心问题 |
-| 高 | 9 | 优化7 动态k（单独） | 可测 + 针对高负载场景 |
-| **高** | **11** | **优化6+7 叠加（完整版）** | **贴近实际部署，评估整体净增益** |
-| 低 | 10 | 优化8 树状 | 需先接线，暂缓 |
-
-> **共同要求**：轮次 8/9/11 都必须同时采集 §2.4 的 proposer 内部指标（尤其"无效投机率""平均 draft 长度"），否则无法归因。
 
 ---
 
@@ -505,7 +431,7 @@ vllm bench serve \
 **优化点 7 在低负载下无回归且有显著收益**：吞吐持平（-0.25% < 5% 安全线），
 TPOT -15.8%、E2EL -14.5%。完全符合设计意图（"轻负载激进投机，重负载保守"）。
 
-### 5.6 优化点 7 高负载 + 优化点 6+7 叠加结论（2026-08-29，QPS 50）
+### 5.6 优化点 7 高负载结论（2026-08-29，QPS 50）
 
 > 测试配置：`prefix_repetition`，800 请求，**QPS 50（严重过载，~60% 请求失败）**。
 
@@ -523,9 +449,9 @@ TPOT -15.8%、E2EL -14.5%。完全符合设计意图（"轻负载激进投机，
 > 高负载（load>0.8）下动态 k 主动调小（保守投机），减少无效 draft 验证开销，
 > 体现优化点 7 的核心价值："高负载不投机拖累"。
 
-#### 完整版（6+7 叠加）与过程中修复的 bug
+#### 过程中发现并修复的 bug（优化点 7）
 
-第一次跑完整版（6+7）时**崩溃**，定位并修复了一个 bug：
+优化点 7（动态 k）测试时**崩溃**，定位并修复了一个 bug：
 
 ```
 File "metrics.py", line 43, in observe_draft
@@ -538,11 +464,10 @@ AssertionError
 接受 token 数 > 4 时崩溃。
 
 **修复**（`vllm/v1/spec_decode/metrics.py`）：断言改为"接受 ≤ 提出"（本质约束），
-`num_accepted_tokens_per_pos` 数组按需动态扩展。修复后完整版不再崩溃。
+`num_accepted_tokens_per_pos` 数组按需动态扩展。修复后不再崩溃。
 
-> ⚠️ **覆盖范围澄清**：完整版（6+7）的 TPOT -12.2% 是 6 和 7 叠加的混合结果，**无法单独归因给 6 或 7**。
-> 但结合 §5.4 单独测 6 在 prefix_repetition 下无效（命中率仅 4.9%），推测主要贡献来自**优化点 7**。
-> 优化点 8（树状）未启用且未接线，不计入。
+> ⚠️ **覆盖范围澄清**：高负载下的 TPOT -12.2% 是**优化点 7 单独**的效果
+> （对照组基础版 vs 实验组 +动态 k，均未启用优化点 4/6/8）。
 
 ---
 
@@ -554,10 +479,8 @@ AssertionError
 - [x] B 优化（adaptive）接受率 + 吞吐（§5.4，prefix_repetition 接受率 ~74%）
 - [x] 第一轮对比分析（prefix_repetition，优化无效，见 §5.4）
 - [x] spec_bench 数据集（轮次2，§3.3）已跑通，修复了 SpecBench.sample bug
-- [x] **优化点 6 测试**（轮次8，§3.4.1）：prefix_repetition 下**无效**（全局池命中率仅 4.9%，接受率 -6pp）
 - [x] **优化点 7 测试**（§5.5/§5.6）：低负载（QPS10）TPOT -15.8% 无回归；高负载（QPS50）TPOT -12.2%
-- [x] **优化点 6+7 叠加**（§5.6）：QPS50 TPOT -12.2%、E2EL -9.7%（主要归因优化7）；修复了 metrics.py 断言崩溃 bug
-- [ ] 优化点 8 测试（§3.4.3）：**需先接线 `propose_tree` 到推理主循环**，暂不可测
+- [x] 修复 metrics.py 断言崩溃 bug（优化点 7 的动态 k 触发）
 - [ ] 第三轮：sharegpt 数据集（轮次3，§3.3）基础对比
 - [ ] k 扫描实验（k=2/4/8，轮次5）——验证长 draft 场景优势
 - [ ] 上下文长度对照（512 vs 4K，轮次6）——验证增量 SAM 价值
