@@ -40,7 +40,15 @@ class SpecDecodingStats:
         self.num_drafts += 1
         self.num_draft_tokens += num_draft_tokens
         self.num_accepted_tokens += num_accepted_tokens
-        assert num_accepted_tokens <= self.num_spec_tokens
+        # Never accept more tokens than were proposed.
+        assert num_accepted_tokens <= num_draft_tokens
+        # Dynamic speculation length (Optimization 7) can produce drafts longer
+        # than the configured num_spec_tokens; grow the per-position array on
+        # demand instead of asserting against the fixed configured length.
+        if num_accepted_tokens > self.num_spec_tokens:
+            self.num_accepted_tokens_per_pos.extend(
+                [0] * (num_accepted_tokens - len(self.num_accepted_tokens_per_pos))
+            )
         for i in range(num_accepted_tokens):
             self.num_accepted_tokens_per_pos[i] += 1
 
