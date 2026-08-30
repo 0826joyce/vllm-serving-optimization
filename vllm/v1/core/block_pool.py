@@ -188,6 +188,12 @@ class BlockPool:
 
         self.metrics_collector = metrics_collector
 
+        # Optimization 2 observability: cumulative number of times a free
+        # block was re-accessed (cache-hit) while in the free queue, i.e. the
+        # number of blocks promoted toward the protected zone. Used by the
+        # periodic internal-state log (see KVCacheManager.new_step_starts).
+        self.promote_count: int = 0
+
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
     ) -> list[KVCacheBlock] | None:
@@ -413,6 +419,7 @@ class BlockPool:
                 # the protected zone instead of probation.
                 if self.enable_caching and self.enable_segmented_lru:
                     block._promoted = True
+                    self.promote_count += 1
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
             if self.metrics_collector:

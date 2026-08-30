@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import os
+
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
@@ -578,3 +580,41 @@ class KVCacheManager:
     def new_step_starts(self) -> None:
         """Called when a new step is started."""
         self.coordinator.new_step_starts()
+        self._maybe_log_prefix_cache_internal_state()
+
+    def _maybe_log_prefix_cache_internal_state(self) -> None:
+        """Optimization 5 (observability): periodically log KV-cache internal
+        state for the prefix-cache optimizations (Segmented LRU zone
+        distribution, promotion count, partial-free count).
+
+        Interval controlled by ``VLLM_PREFIX_CACHE_LOG_INTERVAL`` (default
+        200 steps). No-op when prefix caching / segmented LRU are disabled.
+        """
+        interval = getattr(self, "_pc_internal_log_interval", None)
+        if interval is None:
+            interval = int(os.environ.get("VLLM_PREFIX_CACHE_LOG_INTERVAL", "200"))
+            self._pc_internal_log_interval = interval
+            self._pc_internal_log_step = 0
+        if interval <= 0:
+            return
+        self._pc_internal_log_step += 1
+        if self._pc_internal_log_step % interval != 0:
+            return
+
+        queue = self.block_pool.free_block_queue
+        parts = [
+            f"SegLRU probation={queue.num_probation_blocks}",
+            f"protected={queue.num_protected_blocks}",
+            f"promote={self.block_pool.promote_count}",
+        ]
+        # Aggregate partial-free counters across KV cache groups.
+        pf_count = sum(
+            m.partial_free_count for m in self.coordinator.single_type_managers
+        )
+        pf_kept = sum(
+            m.partial_free_kept_blocks
+            for m in self.coordinator.single_type_managers
+        )
+        parts.append(f"partial_free={pf_count}")
+        parts.append(f"kept_blocks={pf_kept}")
+        logger.info("PrefixCache internal: %s", ", ".join(parts))

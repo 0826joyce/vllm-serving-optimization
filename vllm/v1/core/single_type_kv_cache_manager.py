@@ -81,6 +81,11 @@ class SingleTypeKVCacheManager(ABC):
         self.kv_cache_group_id = kv_cache_group_id
         self._null_block = block_pool.null_block
 
+        # Optimization 3 observability: cumulative partial-free invocations
+        # and retained prefix blocks (for the periodic internal-state log).
+        self.partial_free_count: int = 0
+        self.partial_free_kept_blocks: int = 0
+
     @classmethod
     def _get_num_evictable_blocks(cls, blocks: Sequence[KVCacheBlock]):
         return sum(blk.ref_cnt == 0 and not blk.is_null for blk in blocks)
@@ -347,6 +352,11 @@ class SingleTypeKVCacheManager(ABC):
         keep_prefix_blocks = max(0, min(keep_prefix_blocks, len(blocks)))
         freed_blocks = blocks[keep_prefix_blocks:]
         kept_blocks = blocks[:keep_prefix_blocks]
+
+        # Optimization 3 observability: cumulative partial-free invocations
+        # and retained prefix blocks (for the periodic internal-state log).
+        self.partial_free_count += 1
+        self.partial_free_kept_blocks += len(kept_blocks)
 
         # Release tail blocks in reverse order (same convention as free()).
         ordered_blocks = reversed(freed_blocks)
