@@ -1145,6 +1145,8 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            # True system load (running + waiting) for dynamic spec length.
+            num_unfinished_reqs=self.get_num_unfinished_requests(),
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:

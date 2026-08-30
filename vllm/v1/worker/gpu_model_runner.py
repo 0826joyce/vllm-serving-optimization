@@ -4571,11 +4571,19 @@ class GPUModelRunner(
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, (NgramProposer, AdaptiveSuffixProposer))
             if isinstance(self.drafter, AdaptiveSuffixProposer):
-                # Optimization 7: feed current system load (running / max)
-                # so the proposer can scale speculation length dynamically.
-                num_running = len(self.input_batch.req_ids)
+                # Optimization 7: feed the true system load (running + waiting)
+                # from the scheduler so the proposer can scale speculation
+                # length dynamically. The old "current batch / max_num_seqs"
+                # proxy was always < 0.5 (single-step batch rarely fills the
+                # 128 cap), so heavy load never triggered the conservative
+                # branch. Now the waiting queue growth pushes load toward 1.0.
+                num_unfinished = getattr(
+                    scheduler_output, "num_unfinished_reqs", None
+                )
+                if num_unfinished is None:
+                    num_unfinished = len(self.input_batch.req_ids)
                 self.drafter.set_load(
-                    num_running / max(1, self.max_num_reqs)
+                    num_unfinished / max(1, self.max_num_reqs)
                 )
                 # Feed acceptance feedback before proposing (per request).
                 for i, sampled_ids in enumerate(sampled_token_ids):

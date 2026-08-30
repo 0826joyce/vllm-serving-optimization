@@ -238,6 +238,12 @@ class SchedulerOutput:
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
 
+    # Total number of unfinished requests (running + waiting) after this
+    # scheduling step. Used by AdaptiveSuffixProposer's dynamic speculation
+    # length (Optimization 7) as the true system-load signal, replacing the
+    # flawed "current batch size / max_num_seqs" proxy.
+    num_unfinished_reqs: int = 0
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(
@@ -250,6 +256,7 @@ class SchedulerOutput:
             num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
+            num_unfinished_reqs=0,
         )
 
 
