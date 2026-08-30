@@ -130,6 +130,16 @@ class KVCacheBlock:
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
 
+    # ---- Segmented LRU zone tracking (Optimization 2: frequency-aware
+    # eviction) ----
+    # Which zone of the free queue the block belongs to when it is free.
+    # None = not in free queue, "probation" or "protected".
+    free_zone: str | None = None
+    # Set to True when the block is cache-hit via touch() while in the free
+    # queue. When the block is later freed again (ref_cnt -> 0), it should
+    # enter the protected zone instead of probation.
+    _promoted: bool = False
+
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
         return self._block_hash
@@ -160,96 +170,83 @@ class KVCacheBlock:
 
 
 class FreeKVCacheBlockQueue:
-    """This class organizes a list of KVCacheBlock objects to a doubly linked
-    list of free blocks. We implement this class instead of using Python
-    builtin deque to support removing a block in the middle of the queue
-    in O(1) time. To close the performance gap to the builtin deque which is
-    implemented in C++, this class does not allocate any Python objects when
-    manipulating the linked list. Instead, this class manipulates the
-    prev_free_block and next_free_block attributes of the given blocks.
+    """Segmented LRU free block queue for frequency-aware eviction.
 
-    The queue is ordered by block ID in the beginning. When a block is allocated
-    and then freed, it will be appended back with the eviction order:
-    1. The least recent used block is at the front (LRU).
-    2. If two blocks have the same last accessed time (allocated by the
-       same sequence), the one with more hash tokens (the tail of a block
-       chain) is at the front.
-    Note that we maintain this order by reversing the block order when free
-    blocks of a request. This operation is outside of this class.
+    This class organizes free KVCacheBlock objects into two zones:
+
+    - **Probation Zone**: Blocks that have been freed but not yet re-accessed.
+      These are evicted first (LRU within the zone).
+    - **Protected Zone**: Blocks that were re-accessed (cache hit via touch())
+      while in the probation zone.  These are evicted only when the probation
+      zone is empty.
+
+    The two-zone design prevents high-frequency prefix blocks (e.g. System
+    Prompt) from being evicted by low-frequency long-context blocks.
+
+    All operations remain O(1) using intrusive doubly-linked lists via
+    ``prev_free_block`` / ``next_free_block`` pointers on KVCacheBlock.
+
+    When the protected zone exceeds ``max_protected_blocks``, the oldest
+    protected block is demoted to the *head* of the probation zone so it
+    becomes the next eviction candidate among probation blocks.
 
     Args:
         blocks: A list of KVCacheBlock objects.
+        protected_ratio: Fraction of total blocks reserved for the protected
+            zone.  Default 0.5.
     """
 
-    def __init__(self, blocks: list[KVCacheBlock]) -> None:
-        self.num_free_blocks = len(blocks)
+    def __init__(
+        self,
+        blocks: list[KVCacheBlock],
+        protected_ratio: float = 0.5,
+    ) -> None:
+        # --- Probation zone (doubly-linked list) ---
+        self._probation_head: KVCacheBlock | None = None
+        self._probation_tail: KVCacheBlock | None = None
+        self._num_probation: int = 0
 
-        # Initialize doubly links of consecutive blocks
-        for i in range(self.num_free_blocks):
-            if i > 0:
-                blocks[i].prev_free_block = blocks[i - 1]
-            if i < self.num_free_blocks - 1:
-                blocks[i].next_free_block = blocks[i + 1]
+        # --- Protected zone (doubly-linked list) ---
+        self._protected_head: KVCacheBlock | None = None
+        self._protected_tail: KVCacheBlock | None = None
+        self._num_protected: int = 0
 
-        # Create a fake head and a tail block for the doubly linked list to
-        # reduce branching in the code
-        #
-        # The implementation guaranteed that the fake head and tail
-        # are NEVER got popped, so we could safely assume each real blocks
-        # in the queue has prev and next blocks.
-        self.fake_free_list_head = KVCacheBlock(block_id=-1)
-        self.fake_free_list_tail = KVCacheBlock(block_id=-1)
-        if self.num_free_blocks > 0:
-            # Connect fake_head and fake_tail to the first and last block
-            # respectively.
-            self.fake_free_list_head.next_free_block = blocks[0]
-            blocks[0].prev_free_block = self.fake_free_list_head
-            self.fake_free_list_tail.prev_free_block = blocks[-1]
-            blocks[-1].next_free_block = self.fake_free_list_tail
-        else:
-            # For empty list, simply connect the fake head and tail.
-            self.fake_free_list_head.next_free_block = self.fake_free_list_tail
-            self.fake_free_list_tail.prev_free_block = self.fake_free_list_head
+        self._max_protected: int = max(int(len(blocks) * protected_ratio), 0)
+
+        # All initial blocks go into the probation zone.
+        for block in blocks:
+            self._append_to_zone(block, "probation")
+
+    # ------------------------------------------------------------------
+    # Public interface (compatible with the original FreeKVCacheBlockQueue)
+    # ------------------------------------------------------------------
+
+    @property
+    def num_free_blocks(self) -> int:
+        return self._num_probation + self._num_protected
 
     def popleft(self) -> KVCacheBlock:
-        """Pop the first free block and reduce num_free_blocks by 1.
+        """Pop the next block to evict.
+
+        Eviction priority: probation head first, then protected head.
 
         Returns:
-            The first free block.
+            The evicted block.
         """
-        if (
-            self.fake_free_list_head.next_free_block is self.fake_free_list_tail
-            or self.fake_free_list_head.next_free_block is None
-        ):
-            assert self.num_free_blocks == 0, (
-                f"num_free_blocks ({self.num_free_blocks}) is out of sync "
-                "with the free list."
-            )
-            raise ValueError("No free blocks available")
-
-        first_block: KVCacheBlock = self.fake_free_list_head.next_free_block
-
-        if first_block.next_free_block is None:
-            # This should not happen if the block is from the free list.
-            # It indicates a bug in the caller's logic.
-            raise RuntimeError(
-                "Invalid block found in popleft() "
-                "which doesn't have a valid next_free_block"
-            )
-
-        # Connect fake_head and the next block of first_block (i.e. second block
-        # or fake tail).
-        self.fake_free_list_head.next_free_block = first_block.next_free_block
-        first_block.next_free_block.prev_free_block = self.fake_free_list_head
-
-        # Remove the block from the linked list.
-        first_block.prev_free_block = first_block.next_free_block = None
-
-        self.num_free_blocks -= 1
-        return first_block
+        if self._num_probation > 0:
+            block = self._probation_head
+            assert block is not None
+            self._remove_from_zone(block, "probation")
+            return block
+        if self._num_protected > 0:
+            block = self._protected_head
+            assert block is not None
+            self._remove_from_zone(block, "protected")
+            return block
+        raise ValueError("No free blocks available")
 
     def popleft_n(self, n: int) -> list[KVCacheBlock]:
-        """Pop the first n free blocks and reduce num_free_blocks by n.
+        """Pop the first n free blocks (probation first, then protected).
 
         Args:
             n: The number of blocks to pop.
@@ -260,114 +257,229 @@ class FreeKVCacheBlockQueue:
         if n == 0:
             return []
         assert self.num_free_blocks >= n
-        self.num_free_blocks -= n
-
-        curr_block = self.fake_free_list_head.next_free_block
-        # Pop n blocks from the head of the list
-        ret = []
+        ret: list[KVCacheBlock] = []
         for _ in range(n):
-            assert curr_block is not None
-            ret.append(curr_block)
-            last_block = curr_block
-            curr_block = curr_block.next_free_block
-            # Reset prev_free_block and next_free_block of all popped blocks
-            last_block.prev_free_block = None
-            last_block.next_free_block = None
-
-        if curr_block is not None:
-            # The queue is not empty, connect the fake head to
-            # the new first block.
-            self.fake_free_list_head.next_free_block = curr_block
-            curr_block.prev_free_block = self.fake_free_list_head
+            ret.append(self.popleft())
         return ret
 
     def remove(self, block: KVCacheBlock) -> None:
-        """Remove a block in the free list and reduce num_free_blocks by 1.
+        """Remove a specific block from whichever zone it belongs to.
+
+        Called by ``touch()`` when a free block (ref_cnt == 0) is re-used.
 
         Args:
             block: The block to remove.
         """
-        if block.prev_free_block is None or block.next_free_block is None:
-            # This should not happen if the block is from the free list.
-            # It indicates a bug in the caller's logic.
-            raise RuntimeError(f"remove() called on an invalid block: {block}")
-
-        # Link the previous block to the next block.
-        block.prev_free_block.next_free_block = block.next_free_block
-        # Link the next block to the previous block.
-        block.next_free_block.prev_free_block = block.prev_free_block
-
-        # Remove the block from the linked list.
-        block.prev_free_block = block.next_free_block = None
-        self.num_free_blocks -= 1
+        zone = block.free_zone
+        if zone is None:
+            raise ValueError(
+                f"Block {block.block_id} is not in the free queue")
+        self._remove_from_zone(block, zone)
 
     def append(self, block: KVCacheBlock) -> None:
-        """Put a block back into the free list and increase
-        num_free_blocks by 1.
+        """Release a block back into the free queue (probation zone tail).
+
+        Called when a block's ref_cnt drops to 0.
 
         Args:
             block: The block to append.
         """
-        if self.fake_free_list_tail.prev_free_block is None:
-            raise RuntimeError(
-                "prev_free_block of fake_free_list_tail should always exist"
-            )
-        last_block: KVCacheBlock = self.fake_free_list_tail.prev_free_block
-
-        # Connect the new block after the last block.
-        last_block.next_free_block = block
-        block.prev_free_block = last_block
-
-        # Connect the fake tail after the new block.
-        block.next_free_block = self.fake_free_list_tail
-        self.fake_free_list_tail.prev_free_block = block
-
-        self.num_free_blocks += 1
+        self._append_to_zone(block, "probation")
 
     def append_n(self, blocks: list[KVCacheBlock]) -> None:
-        """Put a list of blocks back into the free list
+        """Put a list of blocks back into the free queue (probation zone tail).
 
         Args:
             blocks: The blocks to append.
         """
-        if len(blocks) == 0:
+        for block in blocks:
+            self._append_to_zone(block, "probation")
+
+    def append_protected(self, block: KVCacheBlock) -> None:
+        """Release a previously-promoted block into the protected zone tail.
+
+        Called when a block that was cache-hit (``_promoted == True``) has its
+        ref_cnt drop back to 0.  If the protected zone is full, the oldest
+        protected block is demoted to the head of the probation zone.
+
+        Args:
+            block: The block to append to protected zone.
+        """
+        if self._num_protected >= self._max_protected and self._max_protected > 0:
+            demoted = self._protected_head
+            assert demoted is not None
+            self._remove_from_zone(demoted, "protected")
+            self._prepend_to_zone(demoted, "probation")
+        self._append_to_zone(block, "protected")
+
+    def promote(self, block: KVCacheBlock) -> None:
+        """Promote a block from probation to protected zone.
+
+        Called when a probation-zone block is cache-hit again via ``touch()``.
+        If the protected zone is full, the oldest protected block is demoted
+        to the head of the probation zone.
+
+        Args:
+            block: The block to promote (must be in probation zone).
+        """
+        if block.free_zone != "probation":
+            # Block is already protected or not in free queue - nothing to do.
             return
 
-        last_block = self.fake_free_list_tail.prev_free_block
-        assert last_block is not None, (
-            "prev_free_block of fake_free_list_tail should always exist"
-        )
-        # Add inter-connections between consecutive blocks
-        for block in blocks:
-            block.prev_free_block = last_block
-            last_block.next_free_block = block
-            last_block = block
+        # Remove from probation.
+        self._remove_from_zone(block, "probation")
 
-        # Connect the last block of <blocks> to the fake tail
-        last_block.next_free_block = self.fake_free_list_tail
-        self.fake_free_list_tail.prev_free_block = last_block
+        # If protected zone is full, demote the oldest protected block.
+        if self._num_protected >= self._max_protected and self._max_protected > 0:
+            demoted = self._protected_head
+            assert demoted is not None
+            self._remove_from_zone(demoted, "protected")
+            # Insert demoted block at the *head* of probation (most likely
+            # to be evicted next among probation blocks).
+            self._prepend_to_zone(demoted, "probation")
 
-        self.num_free_blocks += len(blocks)
+        self._append_to_zone(block, "protected")
 
     def get_all_free_blocks(self) -> list[KVCacheBlock]:
-        """Get all free blocks in the free list. Mainly used for testing.
+        """Get all free blocks (probation first, then protected).
+
+        Mainly used for testing.
 
         Returns:
-            A list of free blocks.
+            A list of free blocks in eviction order.
         """
-        ret = []
-        if self.fake_free_list_head.next_free_block is None:
-            raise RuntimeError(
-                "next_free_block of fake_free_list_head should always exist"
-            )
-        # Start from the first block
-        curr_block: KVCacheBlock = self.fake_free_list_head.next_free_block
-        # As long as next_free_block is available, we haven't reached to
-        # the fake tail yet.
-        while curr_block.next_free_block is not None:
-            ret.append(curr_block)
-            curr_block = curr_block.next_free_block
+        ret: list[KVCacheBlock] = []
+        curr = self._probation_head
+        while curr is not None:
+            ret.append(curr)
+            curr = curr.next_free_block
+        curr = self._protected_head
+        while curr is not None:
+            ret.append(curr)
+            curr = curr.next_free_block
         return ret
+
+    # ------------------------------------------------------------------
+    # Segmented LRU specific query methods (for testing / observability)
+    # ------------------------------------------------------------------
+
+    @property
+    def probation_head(self) -> KVCacheBlock | None:
+        """The head of the probation zone (next eviction candidate)."""
+        return self._probation_head
+
+    @property
+    def probation_tail(self) -> KVCacheBlock | None:
+        """The tail of the probation zone (most recently freed probation)."""
+        return self._probation_tail
+
+    @property
+    def protected_head(self) -> KVCacheBlock | None:
+        """The head of the protected zone (oldest protected block)."""
+        return self._protected_head
+
+    @property
+    def num_probation_blocks(self) -> int:
+        return self._num_probation
+
+    @property
+    def num_protected_blocks(self) -> int:
+        return self._num_protected
+
+    @property
+    def max_protected_blocks(self) -> int:
+        return self._max_protected
+
+    # ------------------------------------------------------------------
+    # Internal linked-list helpers
+    # ------------------------------------------------------------------
+
+    def _append_to_zone(self, block: KVCacheBlock, zone: str) -> None:
+        """Append *block* to the **tail** of *zone*."""
+        head, tail = self._get_zone_endpoints(zone)
+
+        block.prev_free_block = tail
+        block.next_free_block = None
+        if tail is not None:
+            tail.next_free_block = block
+        else:
+            head = block
+        tail = block
+
+        block.free_zone = zone
+        self._set_zone_endpoints(zone, head, tail)
+        self._incr_zone_count(zone)
+
+    def _prepend_to_zone(self, block: KVCacheBlock, zone: str) -> None:
+        """Prepend *block* to the **head** of *zone*."""
+        head, tail = self._get_zone_endpoints(zone)
+
+        block.next_free_block = head
+        block.prev_free_block = None
+        if head is not None:
+            head.prev_free_block = block
+        else:
+            tail = block
+        head = block
+
+        block.free_zone = zone
+        self._set_zone_endpoints(zone, head, tail)
+        self._incr_zone_count(zone)
+
+    def _remove_from_zone(self, block: KVCacheBlock, zone: str) -> None:
+        """Remove *block* from *zone*."""
+        head, tail = self._get_zone_endpoints(zone)
+
+        prev_blk = block.prev_free_block
+        next_blk = block.next_free_block
+
+        if prev_blk is not None:
+            prev_blk.next_free_block = next_blk
+        if next_blk is not None:
+            next_blk.prev_free_block = prev_blk
+        if block is head:
+            head = next_blk
+        if block is tail:
+            tail = prev_blk
+
+        block.prev_free_block = None
+        block.next_free_block = None
+        block.free_zone = None
+
+        self._set_zone_endpoints(zone, head, tail)
+        self._decr_zone_count(zone)
+
+    def _get_zone_endpoints(
+        self, zone: str
+    ) -> tuple[KVCacheBlock | None, KVCacheBlock | None]:
+        if zone == "probation":
+            return self._probation_head, self._probation_tail
+        return self._protected_head, self._protected_tail
+
+    def _set_zone_endpoints(
+        self,
+        zone: str,
+        head: KVCacheBlock | None,
+        tail: KVCacheBlock | None,
+    ) -> None:
+        if zone == "probation":
+            self._probation_head = head
+            self._probation_tail = tail
+        else:
+            self._protected_head = head
+            self._protected_tail = tail
+
+    def _incr_zone_count(self, zone: str) -> None:
+        if zone == "probation":
+            self._num_probation += 1
+        else:
+            self._num_protected += 1
+
+    def _decr_zone_count(self, zone: str) -> None:
+        if zone == "probation":
+            self._num_probation -= 1
+        else:
+            self._num_protected -= 1
 
 
 def need_extra_keys(request: Request) -> bool:

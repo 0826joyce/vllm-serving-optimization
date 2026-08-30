@@ -398,11 +398,11 @@ class SimpleCPUOffloadScheduler:
 
         # Determine start node.
         if self._cursor is None:
-            node = free_queue.fake_free_list_head.next_free_block
+            node = free_queue.probation_head
         else:
             node = self._cursor.next_free_block
 
-        tail = free_queue.fake_free_list_tail
+        tail = free_queue.probation_tail
         gpu_ids: list[int] = []
         block_hashes: list[bytes] = []
         covered = 0

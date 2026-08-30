@@ -444,6 +444,26 @@ class KVCacheManager:
         """
         self.coordinator.free(request.request_id)
 
+    def free_partial(self, request: Request, keep_prefix_blocks: int) -> int:
+        """Partially free the blocks for a preempted request.
+
+        Only tail blocks (beyond *keep_prefix_blocks* head blocks per KV
+        cache group) are released. The retained prefix blocks keep
+        ``ref_cnt > 0`` so they stay protected from eviction, which helps
+        both this request's future resume (partial recompute instead of full)
+        and other requests sharing the same prefix.
+
+        Args:
+            request: The preempted request.
+            keep_prefix_blocks: Number of head blocks to retain per group.
+
+        Returns:
+            The total number of blocks actually freed.
+        """
+        return self.coordinator.free_partial(
+            request.request_id, keep_prefix_blocks
+        )
+
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int
     ) -> None:

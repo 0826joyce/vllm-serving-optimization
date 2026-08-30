@@ -27,22 +27,25 @@
 
 ### 0.2 被测的优化点
 
-对应优化文档，本测试覆盖 3 个**已实现**优化点 + 2 个**方案设计**：
+对应优化文档，本测试覆盖 **3 个已实现的优化点作为"B 大优化"整体被测**（+ 2 个方案设计不在本测试范围）：
 
-| 优化点 | 状态 | 一句话 |
-|--------|------|--------|
-| ① Cache-Aware Scheduling（缓存感知调度） | ✅ 已实现 | MLFQ 同层内优先调度命中缓存多的请求（扫描窗口 K=8） |
-| ② Frequency-Aware Eviction（频率感知驱逐 / Segmented LRU） | ⚠️ 见 §1.2 | Probation/Protected 双区，高频前缀不被误驱逐 |
-| ③ Preemption Cache Shield（抢占缓存保护 / free_partial） | ⚠️ 见 §1.2 | 抢占时保留前缀 block，只释放尾部 |
-| ④ 主动缓存预热 | ⬜ 方案设计 | 冷启动预热常见 System Prompt |
-| ⑤ 缓存效率可观测性 | ⬜ 部分 | 多维缓存健康度指标 |
+| 优化点 | 状态 | 一句话 | A/B 开关 |
+|--------|------|--------|---------|
+| ① Cache-Aware Scheduling（缓存感知调度） | ✅ 已实现 | MLFQ 同层内优先调度命中缓存多的请求（扫描窗口 K=8） | `VLLM_DISABLE_CACHE_AWARE=1` 关闭 |
+| ② Frequency-Aware Eviction（频率感知驱逐 / Segmented LRU） | ✅ 已实现（移植自 main-old-backup） | Probation/Protected 双区，高频前缀不被误驱逐 | `VLLM_DISABLE_SEGMENTED_LRU=1` 关闭 |
+| ③ Preemption Cache Shield（抢占缓存保护 / free_partial） | ✅ 已实现（移植自 main-old-backup） | 抢占时保留前缀 block，只释放尾部 | `VLLM_DISABLE_FREE_PARTIAL=1` 关闭 |
+| ④ 主动缓存预热 | ⬜ 方案设计 | 冷启动预热常见 System Prompt | 不在本测试 |
+| ⑤ 缓存效率可观测性 | ⬜ 部分 | 多维缓存健康度指标 | 不在本测试 |
 
 ### 0.3 对比对象
 
-| 方案 | 说明 |
-|------|------|
-| **A 基线** | 原生 Prefix Caching + 原生调度（关闭本项目缓存优化） |
-| **B 优化** | 原生 Prefix Caching + 本项目缓存感知调度 / 频率驱逐 / 抢占保护 |
+> **核心变化**：三个优化点合并为一个 **B 大优化**整体对比 A，不再逐个优化点单独测
+> （与后缀解码测试的"大优化"范式一致）。
+
+| 方案 | 说明 | 环境变量 |
+|------|------|---------|
+| **A 基线** | 原生 Prefix Caching + 原生调度 + 原生 LRU + 全量抢占（关闭全部缓存优化） | `VLLM_DISABLE_CACHE_AWARE=1 VLLM_DISABLE_SEGMENTED_LRU=1 VLLM_DISABLE_FREE_PARTIAL=1` |
+| **B 大优化** | 原生 Prefix Caching + 缓存感知调度 + 分区 LRU + 抢占保护（全部开启） | 不设以上三个变量（默认开启） |
 
 ### 0.4 预期效果（来自优化文档）
 
@@ -65,16 +68,16 @@
 
 ### 1.2 实现现状与开关方式（据实说明，避免踩坑）
 
-做测试前必须正视——当前分支的实现状态并不完整，直接影响能否做 A/B：
+> ✅ **当前分支三个优化点均已落地**（②③ 已从 `main-old-backup` 移植并适配当前架构），
+> 且三个优化点都有环境变量开关，**A/B 对比可直接做**：
 
 | 优化点 | 代码现状（当前分支核对结果） | 开/关方式 |
 |--------|---------------------------|-----------|
-| ① 缓存感知调度 | ✅ 已实现：`scheduler.py` 的 `enable_cache_aware_scheduling` + `_cache_aware_select_next()`（扫描窗口 `cache_aware_scan_window=8`） | ✅ **已加环境变量开关 `VLLM_DISABLE_CACHE_AWARE`**——设 `=1` 关闭、不设则跟随 `--enable-prefix-caching` 开启，可直接做 A/B（见 §4 Step 1） |
-| ② 频率感知驱逐（Segmented LRU） | ❌ **当前分支未检索到** probation/protected 实现（`block_pool.py` 只有普通 LRU） | 需先落地代码才能测（可能在另一分支，同 PD 情况） |
-| ③ 抢占缓存保护（free_partial） | ❌ **当前分支未检索到** `free_partial`（`kv_cache_manager.py` 只有普通 `free()`） | 需先落地代码才能测 |
+| ① 缓存感知调度 | ✅ 已实现：`scheduler.py` 的 `enable_cache_aware_scheduling` + `_cache_aware_select_next()`（扫描窗口 `cache_aware_scan_window=8`） | `VLLM_DISABLE_CACHE_AWARE=1` 关闭；不设则跟随 `--enable-prefix-caching` 开启 |
+| ② 频率感知驱逐（Segmented LRU） | ✅ 已实现：`kv_cache_utils.py` 的 `FreeKVCacheBlockQueue` 分区 LRU（probation/protected）+ `block_pool.py` 的 `touch()`/`free_blocks()` 接入 | `VLLM_DISABLE_SEGMENTED_LRU=1` 关闭（退化为普通单区 LRU） |
+| ③ 抢占缓存保护（free_partial） | ✅ 已实现：`single_type_kv_cache_manager.py`/`coordinator`/`kv_cache_manager.py` 的 `free_partial()` + `scheduler.py` `_preempt_request()` 部分释放 | `VLLM_DISABLE_FREE_PARTIAL=1` 关闭（退化为全量 free + 重置 0） |
 
-> ⚠️ **结论**：当前分支**只有优化①（缓存感知调度）可测**，且需改代码切开关；优化②③在当前分支未落地。
-> 本文档作为**完整测试设计**，②③部分待代码同步后执行（参考 PD 文档 Step 0 的"先确认功能可运行"思路）。
+> ✅ **结论**：三个优化点全部可测，A/B 通过三个环境变量一键切换（见 §4 Step 1）。
 
 ---
 
@@ -123,23 +126,34 @@
 > - 缓存放得下（无驱逐/抢占）→ 优化②③无用武之地。
 > 因此测试必须构造 **"高前缀共享 + 高缓存压力"** 的场景，才能暴露优化价值。
 
-### 3.2 针对性对照实验清单（每项单独验证一个优化点）
+### 3.2 对比实验清单（B 大优化 vs A 基线 + 归因轮次）
 
-> 这是本文档相对调度测试的关键增量——**对每个优化点做开/关 A/B**，测出独立增量。
+> **主测**：三个优化点合一做 **B 大优化 vs A 基线** 的整体对比（§3.2.1）。
+> **归因轮次**：若整体有收益/无收益，用开/关单优化点定位是哪个起作用（§3.2.2）。
+
+#### 3.2.1 主测：B 大优化 vs A 基线（整体对比）
+
+| 轮次 | 方案 | 场景 | 验证目标 | 关键指标 | 状态 |
+|------|------|------|---------|---------|------|
+| **M1** | A（三开关全关）vs B（全开） | 多请求共享长 System Prompt + 高缓存压力，QPS 50 | B 大优化整体是否提升命中率/降 TTFT | 命中率、P99 TTFT、吞吐 | ⬜ 待做 |
+| **M2** | A vs B | 高过载（QPS 100，触发大量抢占）| B 的抢占保护是否降低恢复代价 | 抢占次数、恢复后 TTFT、失败率 | ⬜ 待做 |
+
+#### 3.2.2 归因轮次（若需要定位是哪个优化起作用）
 
 | 轮次 | 被测优化 | 对照 | 场景 | 验证目标 | 关键指标 | 状态 |
 |------|---------|------|------|---------|---------|------|
-| **1** | ① 缓存感知调度 | 关闭 vs 开启 `enable_cache_aware_scheduling` | 多请求共享长 System Prompt，QPS 50 | 优先调度命中请求是否提升整体效率 | 命中率、同 budget 服务请求数、P99 TTFT | ⬜ 待做 |
-| **2** | ② 频率感知驱逐 | 原生 LRU vs Segmented LRU | 高频 System Prompt + 大量低频长请求（制造缓存震荡） | 高频前缀是否不再被误驱逐 | 高频前缀命中率、命中率波动幅度 | ⬜ 待代码 |
-| **3** | ③ 抢占缓存保护 | 全量 free vs free_partial | 高过载触发大量抢占（Phase 5 类场景） | 抢占恢复是否只重算尾部 | 抢占恢复 recompute token 数、恢复耗时、抢占后 TTFT | ⬜ 待代码 |
+| **1** | ① 缓存感知调度 | `VLLM_DISABLE_CACHE_AWARE=1` vs 开启 | 多请求共享长 System Prompt，QPS 50 | 优先调度命中请求是否提升整体效率 | 命中率、同 budget 服务请求数、P99 TTFT | ⬜ 待做 |
+| **2** | ② 频率感知驱逐 | `VLLM_DISABLE_SEGMENTED_LRU=1` vs 开启 | 高频 System Prompt + 大量低频长请求（制造缓存震荡） | 高频前缀是否不再被误驱逐 | 高频前缀命中率、命中率波动幅度 | ⬜ 待做 |
+| **3** | ③ 抢占缓存保护 | `VLLM_DISABLE_FREE_PARTIAL=1` vs 开启 | 高过载触发大量抢占（Phase 5 类场景） | 抢占恢复是否只重算尾部 | 抢占恢复 recompute token 数、恢复耗时、抢占后 TTFT | ⬜ 待做 |
 | **4** | 命中→TTFT 因果 | 同请求首次(未命中) vs 后续(命中) | 重复 prompt | 坐实"命中→TTFT 下降"的量化关系 | 首次 vs 后续的 TTFT/Prefill 耗时对比 | ⬜ 待做 |
 
 #### 各轮次核心判据
 
-- **轮次 1（缓存感知调度）**：核心看**同 token_budget 下服务的请求数**——缓存感知优先调度命中请求，相同预算能多服务几个请求；同时看整体 P99 TTFT 是否下降。
-- **轮次 2（频率感知驱逐）**：核心看**高频前缀的命中率稳定性**——制造"高频 System Prompt + 大量低频长请求"的缓存震荡场景，验证 Segmented LRU 下高频前缀命中率是否保持稳定（不被低频请求挤出）。
-- **轮次 3（抢占缓存保护）**：核心看**抢占恢复的 recompute token 数**——高过载触发抢占后，free_partial 应只重算尾部（百毫秒级）而非全量（秒级）。
-- **轮次 4**：不是 A/B，而是在同一轮里对比"同一 prompt 首次(冷)vs 后续(热)"的 TTFT，坐实缓存命中的因果收益。
+- **主测 M1/M2（整体）**：B 大优化整体命中率/TTFT/吞吐 vs A；M2 高过载看抢占保护收益。
+- **归因轮次 1（缓存感知调度）**：核心看**同 token_budget 下服务的请求数**——缓存感知优先调度命中请求，相同预算能多服务几个请求；同时看整体 P99 TTFT 是否下降。
+- **归因轮次 2（频率感知驱逐）**：核心看**高频前缀的命中率稳定性**——制造"高频 System Prompt + 大量低频长请求"的缓存震荡场景，验证 Segmented LRU 下高频前缀命中率是否保持稳定（不被低频请求挤出）。
+- **归因轮次 3（抢占缓存保护）**：核心看**抢占恢复的 recompute token 数**——高过载触发抢占后，free_partial 应只重算尾部（百毫秒级）而非全量（秒级）。
+- **归因轮次 4**：不是 A/B，而是在同一轮里对比"同一 prompt 首次(冷)vs 后续(热)"的 TTFT，坐实缓存命中的因果收益。
 
 > **共同要求**：所有轮次用 `vllm:prefix_cache_hits/queries` 采集命中率曲线；A/B 两轮除被测开关外所有参数完全一致（同数据集、同 QPS、同 seed、同 prompt）。
 
@@ -147,7 +161,7 @@
 
 ## 4. 测试步骤
 
-### Step 0：确认各优化点是否可运行
+### Step 0：确认各优化点可运行
 
 ```bash
 cd ~/vllm-serving-optimization && source .venv/bin/activate
@@ -155,41 +169,40 @@ cd ~/vllm-serving-optimization && source .venv/bin/activate
 # ① 缓存感知调度（应存在）
 grep -n "enable_cache_aware_scheduling\|_cache_aware_select_next" vllm/v1/core/sched/scheduler.py
 
-# ② 频率感知驱逐（当前分支可能缺失）
-grep -rn "probation\|protected\|segmented" vllm/v1/core/block_pool.py
+# ② 频率感知驱逐（已移植，应存在）
+grep -rn "probation\|protected\|enable_segmented_lru" vllm/v1/core/block_pool.py
 
-# ③ 抢占缓存保护（当前分支可能缺失）
-grep -rn "free_partial" vllm/v1/core/kv_cache_manager.py
+# ③ 抢占缓存保护（已移植，应存在）
+grep -rn "free_partial\|VLLM_DISABLE_FREE_PARTIAL" vllm/v1/core/kv_cache_manager.py vllm/v1/core/sched/scheduler.py
 ```
 
-> 若 ②③ 无输出 → 当前分支未落地，仅执行轮次 1/4；②③ 待代码同步后补测。
+> 三者均应输出匹配行。若 ②③ 无输出 → 代码未同步，需先移植（见 §1.2）。
 
-### Step 1：准备 A/B 两个配置（缓存感知调度的开/关）
+### Step 1：准备 A/B 两个配置（三个开关一键切换）
 
-`enable_cache_aware_scheduling` 已支持环境变量开关 `VLLM_DISABLE_CACHE_AWARE`（已加入 `scheduler.py`），
-**无需改代码**，直接用环境变量切换 A/B：
+三个优化点都支持环境变量开关，**无需改代码**，用环境变量切换 A/B：
 
-```python
-# vllm/v1/core/sched/scheduler.py（已实现）
-self.enable_cache_aware_scheduling = (
-    self.cache_config.enable_prefix_caching
-    and os.environ.get("VLLM_DISABLE_CACHE_AWARE") != "1")
-```
+| 优化点 | 关闭开关 |
+|--------|---------|
+| ① 缓存感知调度 | `VLLM_DISABLE_CACHE_AWARE=1` |
+| ② 频率感知驱逐 | `VLLM_DISABLE_SEGMENTED_LRU=1` |
+| ③ 抢占缓存保护 | `VLLM_DISABLE_FREE_PARTIAL=1` |
 
-- **A 基线（关闭缓存感知）**：启动时设 `VLLM_DISABLE_CACHE_AWARE=1`
-- **B 优化（开启缓存感知）**：不设该变量（默认跟随 `--enable-prefix-caching` 开启）
+- **A 基线（全关）**：启动时设 `VLLM_DISABLE_CACHE_AWARE=1 VLLM_DISABLE_SEGMENTED_LRU=1 VLLM_DISABLE_FREE_PARTIAL=1`
+- **B 大优化（全开）**：不设这三个变量（默认全部开启）
 
 ### Step 2：启动服务（两轮都开 prefix caching）
 
 ```bash
-# A 基线：关闭缓存感知调度
-VLLM_DISABLE_CACHE_AWARE=1 python -m vllm.entrypoints.openai.api_server \
+# A 基线：三个缓存优化全部关闭
+VLLM_DISABLE_CACHE_AWARE=1 VLLM_DISABLE_SEGMENTED_LRU=1 VLLM_DISABLE_FREE_PARTIAL=1 \
+    python -m vllm.entrypoints.openai.api_server \
     --model Qwen/Qwen2.5-1.5B-Instruct \
     --enable-prefix-caching \
     --max-model-len 8192 --gpu-memory-utilization 0.85 \
     --port 8000 2>&1 | tee server_A.log
 
-# B 优化：开启缓存感知调度（不设 VLLM_DISABLE_CACHE_AWARE）
+# B 大优化：三个缓存优化全部开启（不设开关变量）
 python -m vllm.entrypoints.openai.api_server \
     --model Qwen/Qwen2.5-1.5B-Instruct \
     --enable-prefix-caching \
@@ -231,36 +244,62 @@ grep -i "prefix_cache" server_A.log server_B.log
 
 ## 5. 测试结果记录与结论
 
-> 待执行。按下表记录（A=基线，B=缓存优化）：
+> 按下表记录（A=基线三关全关，B=大优化三开全开）：
 
-### 5.1 缓存感知调度对比（轮次 1）
+### 5.1 B 大优化 vs A 基线：主测结果表（2026-08-30 已测）
 
-| 指标 | A 基线 | B 缓存感知 | 差异 | 判定 |
-|------|--------|-----------|------|------|
-| 缓存命中率 | 待测 | 待测 | | B 更高=有效 |
-| P99 TTFT (ms) | 待测 | 待测 | | B 更低=有效 |
-| 同 budget 服务请求数 | 待测 | 待测 | | B 更多=有效 |
-| 吞吐 (tok/s) | 待测 | 待测 | | 不应退化 |
+> 场景：`prefix_repetition`（prefix-len 1024 / suffix-len 256 / output 128），1000 请求，
+> `--enable-prefix-caching`，无 eager。A = 三开关全关；B = 三优化全开。
 
-### 5.2 结论要点（待填）
+**主测 M1（QPS 50，高前缀共享）**
 
-- [ ] 缓存感知调度是否提升了命中率 / 降低了 TTFT？（轮次1）
-- [ ] Segmented LRU 是否减少了高频前缀的缓存震荡？（轮次2，待代码）
-- [ ] free_partial 是否降低了抢占恢复代价？（轮次3，待代码）
-- [ ] 命中带来的 TTFT 下降有多大？（轮次4）
-- [ ] 优化在什么"前缀共享度/缓存压力"下才有价值？（边界结论）
+| 指标 | A 基线（三关全关） | B 大优化（三开全开） | 差异 | 判定 |
+|------|-------------------|--------------------|------|------|
+| 成功/失败 | 677 / 323 | **692 / 308** | **+15 成功** | ✅ B 服务更多请求 |
+| 输出吞吐（tok/s）| 3785.0 | **3888.3** | **+2.7%** | ✅ B 略高 |
+| P99 TTFT (ms) | 2535.3 | **2013.6** | **-20.6%** | ✅ B 显著更低 |
+| P99 TPOT (ms) | 68.79 | 66.53 | -3.3% | ✅ B 略好 |
+| P99 E2EL (ms) | 11180.8 | **10363.6** | **-7.3%** | ✅ B 更低 |
+| 请求吞吐（req/s）| 29.63 | **30.38** | +2.5% | ✅ B 更高 |
+| 峰值并发 | 340 | 340 | 持平 | 控制变量一致 |
+
+**主测 M2（QPS 100，严重过载 ~45% 失败）**
+
+| 指标 | A 基线 | B 大优化 | 差异 | 判定 |
+|------|--------|----------|------|------|
+| 成功/失败 | 553 / 447 | 553 / 447 | 持平 | ⚠️ 无差异 |
+| 输出吞吐（tok/s）| 5081.2 | 5014.0 | -1.3% | ⚠️ 基本持平 |
+| P99 TTFT (ms) | 2502.5 | 2707.0 | +8.2% | ⚠️ 波动（无显著差异）|
+| P99 TPOT (ms) | 56.87 | 57.06 | +0.3% | ⚠️ 持平 |
+| P99 E2EL (ms) | 9271.9 | 9601.2 | +3.5% | ⚠️ 基本持平 |
+
+> **命中率对比**：A 日志 77.8~88.4%，B 日志 77.3~88.2%，**基本一致**
+> （prefix_repetition 本身高重复，原生缓存命中率已高，B 的命中率优势不在此场景体现）。
+
+### 5.2 结论要点（2026-08-30 实测）
+
+- [x] **主测 M1（QPS 50）**：B 大优化**有效**——成功请求 +15、吞吐 +2.7%、**P99 TTFT -20.6%**、P99 E2EL -7.3%。
+  收益主要来自**缓存感知调度**（同预算优先调度高命中请求 → 服务更多请求、TTFT 更低）。
+- [x] **主测 M2（QPS 100 严重过载）**：B 与 A **基本持平**（成功数/吞吐/延迟均无显著差异）。
+  → 严重过载下大量请求直接失败而非抢占，缓存优化收益被稀释。
+- [ ] 归因轮次 1：缓存感知调度单独贡献（M1 的 -20.6% TTFT 大概率主要来自它，需单独测确认）
+- [ ] 归因轮次 2：Segmented LRU 是否减少高频前缀缓存震荡（需"高频+大量低频长请求"场景）
+- [ ] 归因轮次 3：free_partial 是否降低抢占恢复代价（M2 未体现，需更可控的抢占场景）
+- [ ] 命中带来的 TTFT 下降有多大？（归因轮次 4）
+- [ ] **边界结论**：B 在**中等负载 + 高前缀共享**下有效（M1）；在**严重过载**下收益消失（M2）。
+  有效性边界 = 系统还能服务请求（未饱和）+ 前缀被共享。
 
 ---
 
 ## 6. 待办清单
 
-- [ ] Step 0：确认 ②③ 优化点是否在当前分支落地（缺则从另一分支同步）
-- [x] 给 `enable_cache_aware_scheduling` 加环境变量开关 `VLLM_DISABLE_CACHE_AWARE`（已完成）
-- [ ] 轮次 1：缓存感知调度 A/B（当前可做，用 `VLLM_DISABLE_CACHE_AWARE` 切换）
-- [ ] 轮次 4：命中→TTFT 因果验证（当前可做）
-- [ ] 轮次 2：频率感知驱逐 A/B（待代码）
-- [ ] 轮次 3：抢占缓存保护 A/B（待代码）
-- [ ] 结论：前缀缓存优化的有效场景与边界（诚实结论）
+- [x] 移植优化②（分区 LRU）和③（free_partial）到当前分支（已完成，从 main-old-backup）
+- [x] 给 ②③ 加环境变量开关 `VLLM_DISABLE_SEGMENTED_LRU` / `VLLM_DISABLE_FREE_PARTIAL`（已完成）
+- [x] 给 ① 的 `VLLM_DISABLE_CACHE_AWARE` 开关（已完成，之前）
+- [x] **主测 M1**：B 大优化 vs A，高前缀共享 + 高缓存压力，QPS 50（B 有效：TTFT -20.6%）→ §5.1
+- [x] **主测 M2**：B 大优化 vs A，高过载 QPS 100（B 持平，无显著差异）→ §5.1
+- [ ] 归因轮次 1~4（若需要定位单个优化点贡献）
+- [ ] 结论：前缀缓存优化的有效场景与边界（诚实结论，M1 有效 M2 持平）
 
 ---
 

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -158,6 +160,11 @@ class BlockPool:
         self.num_gpu_blocks = num_gpu_blocks
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
+        # Optimization 2 (frequency-aware eviction / Segmented LRU): on by
+        # default; disable with VLLM_DISABLE_SEGMENTED_LRU=1 for A/B
+        # benchmarking (falls back to plain single-zone LRU).
+        self.enable_segmented_lru = (
+            os.environ.get("VLLM_DISABLE_SEGMENTED_LRU") != "1")
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
@@ -400,6 +407,12 @@ class BlockPool:
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
+                # Optimization 2 (frequency-aware eviction): a free block that
+                # is re-accessed is a high-frequency prefix (e.g. System
+                # Prompt). Mark it so that when it is freed again it enters
+                # the protected zone instead of probation.
+                if self.enable_caching and self.enable_segmented_lru:
+                    block._promoted = True
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
             if self.metrics_collector:
@@ -417,9 +430,31 @@ class BlockPool:
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
             block.ref_cnt -= 1
-        self.free_block_queue.append_n(
-            [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
-        )
+        if self.enable_segmented_lru:
+            # Optimization 2 (frequency-aware eviction): split freed blocks
+            # into protected (previously cache-hit while free) vs probation
+            # (normal).
+            promoted_blocks = []
+            normal_blocks = []
+            for block in blocks_list:
+                if block.ref_cnt == 0 and not block.is_null:
+                    if block._promoted:
+                        block._promoted = False
+                        promoted_blocks.append(block)
+                    else:
+                        normal_blocks.append(block)
+            for block in promoted_blocks:
+                self.free_block_queue.append_protected(block)
+            self.free_block_queue.append_n(normal_blocks)
+        else:
+            # Plain single-zone LRU (A baseline behavior).
+            self.free_block_queue.append_n(
+                [
+                    block
+                    for block in blocks_list
+                    if block.ref_cnt == 0 and not block.is_null
+                ]
+            )
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.

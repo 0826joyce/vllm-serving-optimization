@@ -317,6 +317,58 @@ class SingleTypeKVCacheManager(ABC):
         self.block_pool.free_blocks(ordered_blocks)
         self.num_cached_block.pop(request_id, None)
 
+    def free_partial(
+        self, request_id: str, keep_prefix_blocks: int
+    ) -> int:
+        """Partially free blocks for a preempted request.
+
+        Only tail blocks (beyond *keep_prefix_blocks*) are released. The
+        retained prefix blocks keep ``ref_cnt > 0`` so they remain protected
+        from eviction, benefiting both this request's future resume and other
+        requests sharing the same prefix.
+
+        ``req_to_blocks`` is updated to contain only the kept blocks.
+        ``num_cached_block`` is clamped to not exceed the kept count so that
+        ``get_computed_blocks`` on resume can still leverage the retained
+        prefix blocks' hash chain.
+
+        Args:
+            request_id: The preempted request ID.
+            keep_prefix_blocks: Number of head blocks to retain (ref_cnt stays
+                unchanged).
+
+        Returns:
+            The number of blocks actually freed.
+        """
+        blocks = self.req_to_blocks.get(request_id)
+        if not blocks:
+            return 0
+
+        keep_prefix_blocks = max(0, min(keep_prefix_blocks, len(blocks)))
+        freed_blocks = blocks[keep_prefix_blocks:]
+        kept_blocks = blocks[:keep_prefix_blocks]
+
+        # Release tail blocks in reverse order (same convention as free()).
+        ordered_blocks = reversed(freed_blocks)
+
+        self.block_pool.free_blocks(ordered_blocks)
+
+        if kept_blocks:
+            self.req_to_blocks[request_id] = kept_blocks
+        else:
+            self.req_to_blocks.pop(request_id, None)
+
+        # Update num_cached_block to not exceed the kept blocks count.
+        prev_cached = self.num_cached_block.get(request_id, 0)
+        if keep_prefix_blocks > 0:
+            self.num_cached_block[request_id] = min(
+                prev_cached, keep_prefix_blocks
+            )
+        else:
+            self.num_cached_block.pop(request_id, None)
+
+        return len(freed_blocks)
+
     @abstractmethod
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """

@@ -317,14 +317,8 @@ def test_prefill(hash_fn):
     )
 
     assert free_block_queue.num_free_blocks == 0
-    assert (
-        free_block_queue.fake_free_list_head.next_free_block
-        is free_block_queue.fake_free_list_tail
-    )
-    assert (
-        free_block_queue.fake_free_list_tail.prev_free_block
-        is free_block_queue.fake_free_list_head
-    )
+    assert free_block_queue.probation_head is None
+    assert free_block_queue.protected_head is None
 
 
 def test_prefill_hybrid_model():
@@ -2620,3 +2614,89 @@ def test_can_fit_full_sequence_full_attention_still_gates_oversized():
     req = make_request("oversized", list(range(prompt_len)), block_size, sha256)
 
     assert not manager.can_fit_full_sequence(req)
+
+
+def test_free_partial_keeps_prefix_blocks():
+    """Optimization 3: partial free retains cacheable prefix blocks."""
+    block_size = 16
+    manager = KVCacheManager(
+        make_kv_cache_config(block_size, 20),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+
+    # 5 full blocks of common prefix + unique tail.
+    common = [i for i in range(5) for _ in range(16)]
+    unique = [9] * 40  # 2.5 blocks
+    req = make_request("preempt", common + unique, block_size, sha256)
+    computed_blocks, num_computed_tokens = manager.get_computed_blocks(req)
+    assert num_computed_tokens == 0
+    blocks = manager.allocate_slots(
+        req, 5 * 16 + 40, len(computed_blocks.blocks[0]) * 16, computed_blocks
+    )
+    assert blocks is not None
+    total_blocks = len(blocks.get_block_ids()[0])
+    # Common prefix (5) + unique tail (3) = 8 blocks.
+    assert total_blocks == 8
+
+    # Partial free: keep the 5 hashed prefix blocks, free the tail.
+    freed = manager.free_partial(req, keep_prefix_blocks=5)
+    assert freed == total_blocks - 5
+
+    # The request still owns the 5 prefix blocks.
+    remaining = manager.get_blocks(req.request_id)
+    assert remaining.get_block_ids()[0] == blocks.get_block_ids()[0][:5]
+
+    # num_cached_block must be clamped to the kept count.
+    remaining_blocks = manager.coordinator.single_type_managers[0].req_to_blocks[
+        req.request_id
+    ]
+    assert manager.coordinator.single_type_managers[0].num_cached_block[
+        req.request_id
+    ] == min(5, len(remaining_blocks))
+
+
+def test_free_partial_resume_reuses_prefix():
+    """Optimization 3: after partial free, resume reuses retained blocks.
+
+    This mirrors the scheduler resume path: after preemption the request's
+    num_computed_tokens is set to the retained prefix length, so on resume
+    only the remaining tokens are newly allocated (no get_computed_blocks
+    call).
+    """
+    block_size = 16
+    manager = KVCacheManager(
+        make_kv_cache_config(block_size, 20),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+
+    common = [i for i in range(5) for _ in range(16)]
+    unique = [9] * 40
+    req = make_request("resume", common + unique, block_size, sha256)
+    computed_blocks, _ = manager.get_computed_blocks(req)
+    blocks = manager.allocate_slots(
+        req, 5 * 16 + 40, len(computed_blocks.blocks[0]) * 16, computed_blocks
+    )
+    assert blocks is not None
+    total_blocks = len(blocks.get_block_ids()[0])
+    assert total_blocks == 8
+
+    # Partial free keeps 5 prefix blocks (as done by _preempt_request).
+    manager.free_partial(req, keep_prefix_blocks=5)
+    req.num_computed_tokens = 5 * block_size
+
+    # Resume: allocate only the remaining unique tokens (40). The retained
+    # prefix is reflected in request.num_computed_tokens, so no new computed
+    # blocks are passed.
+    blocks2 = manager.allocate_slots(req, 40)
+    assert blocks2 is not None
+    # The 5 retained prefix blocks are reused (ref_cnt > 0); only the unique
+    # tail (40 tokens -> 3 blocks) is newly allocated.
+    assert len(blocks2.get_block_ids()[0]) == 3
+
+    # The request's full block list includes the retained prefix + new tail.
+    all_blocks = manager.get_blocks(req.request_id)
+    assert len(all_blocks.get_block_ids()[0]) == 8

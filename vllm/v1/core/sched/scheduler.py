@@ -73,6 +73,12 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
+# Optimization 3 (preemption cache shield): partial free must release at
+# least this many tail blocks, otherwise it degrades to a full free so the
+# preemption loop always makes progress (avoids spinning on requests whose
+# blocks are almost all cacheable).
+_PREEMPT_MIN_FREE_BLOCKS = 1
+
 
 class Scheduler(SchedulerInterface):
     def __init__(
@@ -1182,10 +1188,42 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
-        self.kv_cache_manager.free(request)
+        # Optimization 3 (preemption cache shield): partially free the request
+        # so that cacheable prefix blocks are retained for fast resume instead
+        # of a full recompute. Fall back to full free when too few blocks can
+        # be released (guarantees the preemption loop makes progress).
+        # Disable with VLLM_DISABLE_FREE_PARTIAL=1 for A/B benchmarking
+        # (falls back to the original full-free preemption).
+        if os.environ.get("VLLM_DISABLE_FREE_PARTIAL") == "1":
+            self.kv_cache_manager.free(request)
+            request.num_computed_tokens = 0
+        else:
+            keep_count = 0
+            if self.kv_cache_manager.enable_caching:
+                kv_blocks = self.kv_cache_manager.get_blocks(request.request_id)
+                if kv_blocks.blocks:
+                    # The main KV cache group (index 0) determines the prefix
+                    # length. Count contiguous hashed blocks from the head.
+                    for blk in kv_blocks.blocks[0]:
+                        if blk.block_hash is not None:
+                            keep_count += 1
+                        else:
+                            break  # hash chain broken, no further blocks useful
+
+            preempt_blocks = self.kv_cache_manager.get_blocks(
+                request.request_id)
+            total_blocks = (
+                len(preempt_blocks.blocks[0]) if preempt_blocks.blocks else 0
+            )
+            would_free = total_blocks - keep_count
+            if keep_count > 0 and would_free >= _PREEMPT_MIN_FREE_BLOCKS:
+                self.kv_cache_manager.free_partial(request, keep_count)
+                request.num_computed_tokens = keep_count * self.block_size
+            else:
+                self.kv_cache_manager.free(request)
+                request.num_computed_tokens = 0
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
-        request.num_computed_tokens = 0
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.num_preemptions += 1

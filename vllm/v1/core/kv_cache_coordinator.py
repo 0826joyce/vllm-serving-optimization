@@ -218,6 +218,28 @@ class KVCacheCoordinator(ABC):
         for manager in self.single_type_managers:
             manager.free(request_id)
 
+    def free_partial(
+        self, request_id: str, keep_prefix_blocks: int
+    ) -> int:
+        """Partially free blocks for a preempted request across all groups.
+
+        Retains the first *keep_prefix_blocks* blocks of each group so that
+        preempted requests with cacheable prefixes can resume with partial
+        recompute instead of full recompute. See
+        ``SingleTypeKVCacheManager.free_partial`` for per-group semantics.
+
+        Args:
+            request_id: The preempted request ID.
+            keep_prefix_blocks: Number of head blocks to retain per group.
+
+        Returns:
+            The total number of blocks actually freed across all groups.
+        """
+        total_freed = 0
+        for manager in self.single_type_managers:
+            total_freed += manager.free_partial(request_id, keep_prefix_blocks)
+        return total_freed
+
     def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
         """
         Get the number of common prefix blocks for all requests with allocated
